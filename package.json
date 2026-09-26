@@ -1,0 +1,29 @@
+{
+  "name": "werewolf-wechat",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "12人狼人杀（预女猎白）—— 服务端权威 + WebSocket 实时 + 零构建 H5 客户端，可复用同一后端扩展到微信小程序",
+  "scripts": {
+    "start": "node scripts/run.mjs src/server/index.ts",
+    "dev": "node scripts/run.mjs src/server/index.ts",
+    "test": "node scripts/run.mjs src/shared/engine.test.ts && node scripts/run.mjs scripts/lib/firewall.test.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.client.json",
+    "smoke": "node scripts/run.mjs scripts/smoke.ts",
+    "bots": "node scripts/run.mjs scripts/bots.ts",
+    "doctor": "node scripts/run.mjs scripts/doctor.ts",
+    "icons": "node scripts/make-icons.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.5.13",
+    "typescript": "^5.7.2",
+    "vue": "^3.5.13"
+  },
+  "engines": {
+    "node": ">=22.18"
+  }
+}

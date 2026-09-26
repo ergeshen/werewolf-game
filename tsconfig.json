@@ -1,0 +1,28 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2023"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "types": ["node"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    /**
+     * 关键：本项目用 Node 内置的类型擦除直接运行 .ts（没有 tsc/esbuild 编译步骤），
+     * 因此只能用「可擦除」的语法。开启这个开关后，enum / namespace /
+     * 构造函数参数属性 这类需要代码生成的写法会在类型检查阶段就报错，
+     * 而不是等到运行时抛 ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX。
+     */
+    "erasableSyntaxOnly": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": ["src/**/*.ts", "scripts/**/*.ts"]
+}
