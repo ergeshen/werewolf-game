@@ -11,7 +11,7 @@
 ## 一、怎么跑起来
 
 只需要两步。**不需要另装数据库，不需要编译前端，不需要任何云服务。**
-服务端会使用 Node 内置 SQLite，并自动创建 `data/werewolf.db` 保存账号和战绩。
+本地运行时服务端会使用 libSQL/SQLite，并自动创建 `data/werewolf.db` 保存账号和战绩。
 
 ```powershell
 npm install          # 第一次运行需要（只需一次）
@@ -135,7 +135,9 @@ npm run bots -- AB3D7K        # 默认塞 11 个机器人，凑满 12 人
 - 普通玩家只能看胜负和身份次数；厅主额外看到积分、排名和每场得分，并且只有厅主能删除场次。
 - 积分规则：狼人胜 3 分、好人胜 1.5 分、狼人负 0.5 分、好人负 0 分；第一夜锁定的悍跳位在狼队获胜时再加 1 分。
 - 「重新发牌」会彻底丢弃当前牌局并保持原场次编号；「结束并回大厅」会保存为提前结束，但不计胜负、身份次数和积分。
-- 账号与战绩保存在 SQLite；**正在进行的房间仍只在内存里，服务端重启会丢失未结束对局。**
+- 未配置 Turso 时，账号与战绩保存在本地 SQLite；同时设置 `TURSO_DATABASE_URL` 和
+  `TURSO_AUTH_TOKEN` 后则保存在 Turso 云数据库，可跨 Render 重启和重新部署保留。
+- **正在进行的房间仍只在内存里，服务端重启会丢失未结束对局。**
 
 公网使用时必须放在 HTTPS/WSS 反向代理后面，否则密码和会话令牌会以明文网络流量传输。
 
@@ -154,7 +156,7 @@ npm run bots -- AB3D7K        # 默认塞 11 个机器人，凑满 12 人
 │   └── server/
 │       ├── index.ts          入口：HTTP + WebSocket + 前端 TS 实时转译
 │       ├── hub.ts            房间 / 会话 / 断线重连 / 阶段定时器
-│       ├── database.ts       SQLite 账号 / 登录会话 / 对局战绩
+│       ├── database.ts       本地 SQLite / Turso 账号、登录会话与战绩
 │       ├── database.test.ts  8 个账号、大厅与战绩测试
 │       └── static.ts         静态文件服务
 ├── web/                   ← 前端（零构建，浏览器直接加载）
@@ -361,6 +363,11 @@ npm run smoke                         # 终端 B
 | `WEREWOLF_HOST` | `0.0.0.0` | 监听地址。只想本机访问就设 `127.0.0.1` |
 | `WEREWOLF_TIMEOUT_SCALE` | `1` | 阶段时长倍率。`0.05` = 快速模式，用于测试和演示 |
 | `WEREWOLF_DB_PATH` | `data/werewolf.db` | SQLite 数据库位置；自动化测试可设为 `:memory:` |
+| `TURSO_DATABASE_URL` | 未设置 | Turso 的 `libsql://...` 数据库地址；设置后优先使用 Turso |
+| `TURSO_AUTH_TOKEN` | 未设置 | Turso 读写 Token；必须和 URL 一起设置，严禁提交到 GitHub |
+
+Render 免费实例没有持久化磁盘。要长期保存账号和战绩，应在 Render 的 Environment 页面设置
+上述两个 Turso 变量；只设置 URL 而漏掉 Token 时，服务端会拒绝启动并给出明确错误。
 
 调试手机端问题时，在链接后面加 `?debug=1`，就能在页面控制台用 `window.__werewolf` 查看客户端状态
 （手机上没法开开发者工具，这个很有用）。

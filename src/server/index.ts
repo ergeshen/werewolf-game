@@ -187,7 +187,12 @@ async function handleApi(
   urlPath: string,
 ): Promise<boolean> {
   if (urlPath === '/api/health' && req.method === 'GET') {
-    json(res, { ok: true, uptimeSec: Math.round(process.uptime()), ...hub.stats() });
+    json(res, {
+      ok: true,
+      uptimeSec: Math.round(process.uptime()),
+      database: database.mode,
+      ...hub.stats(),
+    });
     return true;
   }
 
@@ -414,6 +419,7 @@ console.log('  手机打不开？八成是 Windows 防火墙拦了入站，先�
 console.log('      npm run doctor');
 console.log('');
 console.log(`  健康检查    http://localhost:${PORT}/api/health`);
+console.log(`  数据库存储  ${database.mode === 'turso' ? 'Turso 云数据库' : '本地 SQLite'}`);
 console.log(line);
 
 // ─────────────────── 优雅退出 ───────────────────

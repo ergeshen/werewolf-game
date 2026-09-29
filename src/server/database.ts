@@ -1,7 +1,7 @@
 import { randomBytes, randomUUID, scryptSync, timingSafeEqual } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
+import Database from 'libsql';
 
 import type { Outcome } from '../shared/protocol.ts';
 import {
@@ -130,13 +130,39 @@ function passwordMatches(password: string, salt: string, expectedHex: string): b
 }
 
 export class GameDatabase {
-  private readonly db: DatabaseSync;
+  private readonly db: Database.Database;
+  readonly mode: 'local' | 'turso';
 
-  constructor(path = process.env.WEREWOLF_DB_PATH ?? resolve(import.meta.dirname, '../../data/werewolf.db')) {
-    if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
-    this.db = new DatabaseSync(path);
+  /**
+   * 显式传入 path 时始终使用本地数据库（测试会传 :memory:）。
+   * 正常启动且配置了 TURSO_DATABASE_URL 时，直接连接远程 Turso；否则回退到本地文件。
+   */
+  constructor(path?: string) {
+    const remoteUrl = path === undefined ? process.env.TURSO_DATABASE_URL?.trim() : undefined;
+    const authToken = process.env.TURSO_AUTH_TOKEN?.trim();
+
+    if (remoteUrl) {
+      if (!authToken) {
+        throw new Error('已设置 TURSO_DATABASE_URL，但缺少 TURSO_AUTH_TOKEN');
+      }
+      if (!/^(?:libsql|https):\/\//i.test(remoteUrl)) {
+        throw new Error('TURSO_DATABASE_URL 必须是 libsql:// 或 https:// 地址');
+      }
+      // libsql 0.5 的运行时支持 authToken，但其兼容版类型声明暂未列出该字段。
+      const options = { authToken, timeout: 10_000 } as Database.Options & { authToken: string };
+      this.db = new Database(remoteUrl, options);
+      this.mode = 'turso';
+    } else {
+      const localPath = path ??
+        process.env.WEREWOLF_DB_PATH ??
+        resolve(import.meta.dirname, '../../data/werewolf.db');
+      if (localPath !== ':memory:') mkdirSync(dirname(localPath), { recursive: true });
+      this.db = new Database(localPath);
+      this.mode = 'local';
+    }
+
     this.db.exec('PRAGMA foreign_keys = ON');
-    if (path !== ':memory:') this.db.exec('PRAGMA journal_mode = WAL');
+    if (this.mode === 'local' && path !== ':memory:') this.db.exec('PRAGMA journal_mode = WAL');
     this.migrate();
   }
 
