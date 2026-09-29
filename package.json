@@ -1,16 +1,18 @@
 {
-  "name": "werewolf-wechat",
+  "name": "werewolf-h5",
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "12人狼人杀（预女猎白）—— 服务端权威 + WebSocket 实时 + 零构建 H5 客户端，可复用同一后端扩展到微信小程序",
+  "description": "H5 在线狼人杀——账号、公开大厅、服务端权威规则与 WebSocket 实时对局",
   "scripts": {
     "start": "node scripts/run.mjs src/server/index.ts",
     "dev": "node scripts/run.mjs src/server/index.ts",
-    "test": "node scripts/run.mjs src/shared/engine.test.ts && node scripts/run.mjs scripts/lib/firewall.test.ts",
+    "test": "node scripts/run.mjs src/shared/engine.test.ts && node scripts/run.mjs src/server/database.test.ts && node scripts/run.mjs scripts/lib/firewall.test.ts && node scripts/run.mjs web/app/net.test.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.client.json",
     "smoke": "node scripts/run.mjs scripts/smoke.ts",
+    "smoke:auth": "node scripts/run.mjs scripts/auth-lobby-smoke.ts",
     "bots": "node scripts/run.mjs scripts/bots.ts",
+    "pace": "node scripts/run.mjs scripts/pace.ts",
     "doctor": "node scripts/run.mjs scripts/doctor.ts",
     "icons": "node scripts/make-icons.mjs"
   },

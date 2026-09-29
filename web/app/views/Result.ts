@@ -5,7 +5,7 @@
 
 import { computed, defineComponent } from '../../vendor/vue.esm-browser.prod.js';
 
-import { isHost, leaveRoom, nicknameOf, restartGame, state } from '../store.ts';
+import { askConfirm, closeMatch, isHost, leaveRoom, restartGame, state } from '../store.ts';
 
 const DEATH_CAUSE_LABEL: Record<string, string> = {
   WOLF: '被狼人杀害',
@@ -56,9 +56,43 @@ export const ResultView = defineComponent({
       return deaths.map((d) => ({
         seat: d.seat,
         nickname: d.nickname,
+        when: d.day ? '第 ' + d.day + ' 天' : '—',
         cause: d.cause ? (DEATH_CAUSE_LABEL[d.cause] ?? d.cause) : '—',
       }));
     });
+
+    const playerCapacity = computed(() => state.room?.board.playerCount ?? 0);
+
+    /** 保存正常结算结果，返回同一个大厅开始下一场。 */
+    function endMatch(): void {
+      askConfirm(
+        {
+          title: '保存并返回大厅',
+          message: `第 ${state.room?.matchNumber ?? '?'} 场结果会保存，所有 ${playerCapacity.value} 名玩家返回大厅，之后可发起下一场。`,
+          confirmText: '保存并回大厅',
+          cancelText: '再想想',
+          danger: true,
+        },
+        (ok) => {
+          if (ok) closeMatch();
+        },
+      );
+    }
+
+    function redeal(): void {
+      askConfirm(
+        {
+          title: '本场作废并重新发牌',
+          message: '刚结束的结果会被删除，不计胜负、身份次数和积分，并以同一个场次号立即重新发牌。',
+          confirmText: '确认作废并重发',
+          cancelText: '保留结果',
+          danger: true,
+        },
+        (ok) => {
+          if (ok) restartGame();
+        },
+      );
+    }
 
     return {
       state,
@@ -68,10 +102,12 @@ export const ResultView = defineComponent({
       myResult,
       rows,
       deathRows,
+      playerCapacity,
       restartGame,
+      redeal,
+      endMatch,
       leaveRoom,
       isHost,
-      nicknameOf,
     };
   },
   template: `
@@ -109,17 +145,27 @@ export const ResultView = defineComponent({
           <tr v-for="d in deathRows" :key="d.seat">
             <td class="mono" style="width: 42px;">{{ d.seat }}</td>
             <td class="ellipsis">{{ d.nickname }}</td>
+            <td class="tiny muted" style="width: 60px;">{{ d.when }}</td>
             <td class="tiny muted">{{ d.cause }}</td>
           </tr>
         </table>
       </div>
 
       <div class="panel">
-        <button v-if="isHost" class="primary" @click="restartGame">再来一局（重新发牌）</button>
-        <div v-if="isHost" class="spacer"></div>
-        <button class="ghost" @click="leaveRoom">离开房间</button>
-        <div v-if="!isHost" class="spacer"></div>
-        <div v-if="!isHost" class="tiny muted center">等房主开下一局。</div>
+        <template v-if="isHost">
+          <button @click="redeal">本场作废并重新发牌</button>
+          <div class="spacer"></div>
+          <button class="primary" @click="endMatch">保存结果并返回大厅</button>
+          <div class="spacer"></div>
+          <div class="tiny muted center">
+            重新发牌＝本场结果作废；返回大厅＝保存本场并准备第 {{ (state.room?.matchNumber || 0) + 1 }} 场。
+          </div>
+        </template>
+        <template v-else>
+          <button class="ghost" @click="leaveRoom">离开房间</button>
+          <div class="spacer"></div>
+          <div class="tiny muted center">等房主决定是重开还是结束本场。</div>
+        </template>
       </div>
     </div>
   `,

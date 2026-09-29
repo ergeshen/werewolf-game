@@ -44,12 +44,19 @@ export interface BotOptions {
   onUpdate?: (bot: BotClient) => void;
   /** 是否把每次错误回执记录下来（默认 true） */
   recordErrors?: boolean;
+  /**
+   * 如果是白狼王，是否在白天自爆（默认 false）。
+   * 端到端测试用这个开关把白狼王的完整链路跑一遍 —— 否则随机对局里
+   * 白狼王可能永远不自爆，那条路径就永远没被测到。
+   */
+  wolfKingSelfDestruct?: boolean;
 }
 
 export class BotClient {
   readonly nickname: string;
   readonly obs: BotObservation = newObservation();
   readonly errors: string[] = [];
+  readonly wolfKingSelfDestruct: boolean;
 
   room: RoomView | null = null;
   game: GameView | null = null;
@@ -68,6 +75,7 @@ export class BotClient {
     this.autoPlay = options.autoPlay ?? true;
     this.recordErrors = options.recordErrors ?? true;
     this.onUpdate = options.onUpdate;
+    this.wolfKingSelfDestruct = options.wolfKingSelfDestruct ?? false;
   }
 
   get connected(): boolean {
@@ -76,7 +84,9 @@ export class BotClient {
 
   connect(url: string, token?: string): Promise<void> {
     this.connectionCount += 1;
-    const target = token ? `${url}?token=${encodeURIComponent(token)}` : url;
+    const params = new URLSearchParams({ automation: '1' });
+    if (token) params.set('token', token);
+    const target = `${url}?${params.toString()}`;
     const socket = new WebSocket(target);
     this.socket = socket;
 
@@ -117,7 +127,25 @@ export class BotClient {
         break;
       case 'game':
         this.game = msg.game;
-        if (msg.game) this.auditGameView(msg.game);
+        if (msg.game) {
+          /**
+           * ★ 关键：换局时必须清空 actedKeys。
+           *
+           * 去重键是 `${day}:${phase}`，而同一个 BotClient 会跨局复用。
+           * 不清空的话，第二局第 1 天的 NIGHT_WOLVES / DAY_VOTE 键还留在集合里，
+           * 机器人整局都不出牌 —— 表现就是「第二局莫名其妙 20 天流局」或者
+           * 「白狼王一直不自爆，直到第 5 天才炸」这种看天吃饭的偶发失败。
+           *
+           * 一局永远从「第 1 天 NIGHT_START」开始，用它当新局信号最可靠。
+           */
+          if (msg.game.day === 1 && msg.game.phase === 'NIGHT_START') {
+            this.actedKeys.clear();
+          }
+          this.auditGameView(msg.game);
+        } else {
+          // 回到大厅（重开/散场），把上一局的记录一并清掉
+          this.actedKeys.clear();
+        }
         break;
       case 'error':
         if (this.recordErrors) this.errors.push(`${msg.code}: ${msg.message}`);
@@ -196,7 +224,7 @@ export class BotClient {
     // 视图有往返延迟：收到「轮到我」到「我提交后的新视图」之间有一段窗口，
     // 期间 pump 会被其他玩家的消息反复触发。不去重会重复提交，
     // 服务端会正确回 ALREADY_DONE / BAD_PHASE —— 那是噪音，不是 bug。
-    const key = `${game.day}:${game.phase}`;
+    const key = `${game.day}:${game.phase}${game.phase === 'NIGHT_MASK' && me.maskNeedsDisguise ? ':disguise' : ''}`;
     if (this.actedKeys.has(key)) return;
 
     // 随机取一个候选目标。
@@ -208,6 +236,33 @@ export class BotClient {
     };
 
     switch (game.phase) {
+      case 'NIGHT_HYBRID': {
+        const target = pick(game.myOptions);
+        if (target === null) return;
+        this.send({ t: 'game.action', action: { kind: 'hybrid', target } });
+        break;
+      }
+      case 'NIGHT_MECHANICAL': {
+        const target = pick(game.myOptions);
+        if (target === null) return;
+        this.send({ t: 'game.action', action: { kind: 'mechanicalLearn', target } });
+        break;
+      }
+      case 'NIGHT_DANCER': {
+        if (game.myOptions.length < 3) return;
+        const targets = game.myOptions.slice().sort(() => Math.random() - 0.5).slice(0, 3);
+        this.send({ t: 'game.action', action: { kind: 'dancer', targets } });
+        break;
+      }
+      case 'NIGHT_MASK': {
+        const target = pick(game.myOptions);
+        if (target === null) return;
+        this.send({
+          t: 'game.action',
+          action: me.maskNeedsDisguise ? { kind: 'mask', target } : { kind: 'maskInspect', target },
+        });
+        break;
+      }
       case 'NIGHT_WOLVES': {
         // 刀一个既不是自己、也不是队友的幸存者
         const mates = new Set(me.teammates ?? []);
@@ -216,22 +271,81 @@ export class BotClient {
         this.send({ t: 'game.action', action: { kind: 'wolf', target } });
         break;
       }
+      case 'NIGHT_GUARD': {
+        // myOptions 里已经排除了「上一夜守过的人」，直接挑一个即可
+        const target = pick(game.myOptions);
+        if (target === null) return;
+        this.send({
+          t: 'game.action',
+          action: me.role === 'MECHANICAL_WOLF'
+            ? { kind: 'mechanicalSkill', skill: 'guard', target }
+            : { kind: 'guard', target },
+        });
+        break;
+      }
       case 'NIGHT_WITCH':
         // 机器人女巫不用药，简化测试变量
-        this.send({ t: 'game.action', action: { kind: 'witch', save: false, poison: null } });
+        this.send({
+          t: 'game.action',
+          action: me.role === 'MECHANICAL_WOLF'
+            ? { kind: 'mechanicalSkill', skill: 'poison', target: null }
+            : { kind: 'witch', save: false, poison: null },
+        });
         break;
       case 'NIGHT_SEER': {
         const target = pick(game.myOptions);
         if (target === null) return;
-        this.send({ t: 'game.action', action: { kind: 'seer', target } });
+        this.send({
+          t: 'game.action',
+          action: me.role === 'MECHANICAL_WOLF'
+            ? { kind: 'mechanicalSkill', skill: 'seer', target }
+            : { kind: 'seer', target },
+        });
         break;
       }
+      case 'NIGHT_SPIRIT_SEER': {
+        const target = pick(game.myOptions);
+        if (target === null) return;
+        this.send({
+          t: 'game.action',
+          action: me.role === 'MECHANICAL_WOLF'
+            ? { kind: 'mechanicalSkill', skill: 'spiritSeer', target }
+            : { kind: 'spiritSeer', target },
+        });
+        break;
+      }
+      case 'SHERIFF_SIGNUP':
+        this.send({ t: 'game.sheriffSignup', candidate: me.seat <= 3 });
+        break;
+      case 'SHERIFF_VOTE':
+      case 'SHERIFF_REVOTE':
+        this.send({ t: 'game.sheriffVote', target: pick(game.myOptions) });
+        break;
+      case 'DAY_SPEECH':
+        if (game.sheriffSeat === me.seat && game.speechDirection === null) {
+          this.send({ t: 'game.speechDirection', direction: 'FORWARD' });
+        } else {
+          return;
+        }
+        break;
       case 'DAY_VOTE': {
+        // 白狼王机器人可以在白天自爆（默认关闭，只在端到端测试里打开）
+        if (me.role === 'WOLF_KING' && this.wolfKingSelfDestruct) {
+          this.send({ t: 'game.selfDestruct' });
+          break;
+        }
         this.send({ t: 'game.vote', target: pick(game.myOptions) });
         break;
       }
+      case 'SHERIFF_TRANSFER':
+        this.send({ t: 'game.sheriffTransfer', target: pick(game.myOptions) });
+        break;
       case 'HUNTER_SHOOT':
         this.send({ t: 'game.hunterShoot', target: null });
+        break;
+      case 'WOLF_KING_BOOM':
+        // 自爆后指定带走一个人；myOptions 里没有自己
+        this.send({ t: 'game.boomTarget', target: pick(game.myOptions) });
         break;
       default:
         return;

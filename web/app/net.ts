@@ -21,6 +21,7 @@ const TOKEN_KEY = 'werewolf.token';
 const RETRY_BASE_MS = 800;
 const RETRY_CAP_MS = 6_000;
 const RETRY_MAX = 40;
+const RETRY_IDLE_MS = 30_000;
 const PING_INTERVAL_MS = 25_000;
 
 function safeGet(key: string): string | null {
@@ -48,6 +49,7 @@ export class Net {
   private queue: ClientMsg[] = [];
   private statusValue: ConnStatus = 'connecting';
   private readonly handlers: NetHandlers;
+  private authToken = '';
 
   token: string;
 
@@ -71,10 +73,34 @@ export class Net {
     this.open();
   }
 
+  setAuthToken(token: string): void {
+    this.authToken = token;
+  }
+
+  disconnect(): void {
+    this.closedByUser = true;
+    if (this.retryTimer !== null) {
+      window.clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+    }
+    this.stopPing();
+    const socket = this.socket;
+    this.socket = null;
+    try {
+      socket?.close();
+    } catch {
+      /* ignore */
+    }
+    this.setStatus('closed');
+  }
+
   private open(): void {
     this.setStatus('connecting');
     const scheme = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const query = this.token ? `?token=${encodeURIComponent(this.token)}` : '';
+    const params = new URLSearchParams();
+    if (this.token) params.set('token', this.token);
+    if (this.authToken) params.set('auth', this.authToken);
+    const query = params.size > 0 ? `?${params.toString()}` : '';
     const url = `${scheme}//${window.location.host}/ws${query}`;
 
     let socket: WebSocket;
@@ -87,6 +113,12 @@ export class Net {
     this.socket = socket;
 
     socket.onopen = () => {
+      // 前后台切换时可能已经创建了更新的连接。旧连接即使稍后成功，
+      // 也不能再接管状态，否则两条连接会在服务端互相顶掉。
+      if (this.socket !== socket) {
+        socket.close();
+        return;
+      }
       this.retryCount = 0;
       this.setStatus('open');
       this.startPing();
@@ -94,13 +126,17 @@ export class Net {
     };
 
     socket.onmessage = (event: MessageEvent) => {
+      if (this.socket !== socket) return;
       if (typeof event.data !== 'string') return;
       this.receive(event.data);
     };
 
     socket.onclose = () => {
+      // 被 reconnectNow() 主动替换的旧连接会延迟触发 close。
+      // 忽略它，否则会额外排一个重连，造成连接风暴。
+      if (this.socket !== socket) return;
       this.stopPing();
-      if (this.socket === socket) this.socket = null;
+      this.socket = null;
       this.setStatus('closed');
       if (!this.closedByUser) this.scheduleRetry();
     };
@@ -161,8 +197,12 @@ export class Net {
 
   private scheduleRetry(): void {
     if (this.retryTimer !== null) return;
-    if (this.retryCount >= RETRY_MAX) return;
-    const delay = Math.min(RETRY_BASE_MS * 2 ** this.retryCount, RETRY_CAP_MS);
+    // 前几分钟快速恢复；服务端长时间不可用后降低频率，但永不彻底放弃。
+    // 否则网络恢复后页面仍会永久显示「正在重连」，除非用户手动刷新。
+    const delay =
+      this.retryCount >= RETRY_MAX
+        ? RETRY_IDLE_MS
+        : Math.min(RETRY_BASE_MS * 2 ** this.retryCount, RETRY_CAP_MS);
     this.retryCount += 1;
     this.retryTimer = window.setTimeout(() => {
       this.retryTimer = null;
@@ -188,14 +228,17 @@ export class Net {
 
   /** 页面进入后台时主动断开，回到前台立刻重连 —— 比等 TCP 超时快得多 */
   reconnectNow(): void {
+    if (this.closedByUser) return;
     if (this.retryTimer !== null) {
       window.clearTimeout(this.retryTimer);
       this.retryTimer = null;
     }
     this.retryCount = 0;
-    if (this.socket && this.socket.readyState === WebSocket.OPEN) return;
+    const previous = this.socket;
+    this.socket = null;
+    this.stopPing();
     try {
-      this.socket?.close();
+      previous?.close();
     } catch {
       /* ignore */
     }

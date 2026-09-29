@@ -16,7 +16,7 @@
 import assert from 'node:assert/strict';
 
 import { BotClient } from './lib/bot.ts';
-import type { Role } from '../src/shared/roles.ts';
+import { cloneBoard, presetById, type Role } from '../src/shared/roles.ts';
 
 const PORT = Number(process.env.WEREWOLF_PORT ?? 5180);
 const WS_URL = `ws://127.0.0.1:${PORT}/ws`;
@@ -60,7 +60,9 @@ async function main(): Promise<void> {
   console.log(`\n连接服务端 ${WS_URL}\n`);
 
   for (let i = 1; i <= PLAYER_COUNT; i++) {
-    bots.push(new BotClient(`玩家${i}`));
+    // wolfKingSelfDestruct 对普通狼人无效；只有真的拿到白狼王那张牌的机器人会自爆。
+    // 这样第二个场景不用去猜谁是白狼王。
+    bots.push(new BotClient(`玩家${i}`, { wolfKingSelfDestruct: true }));
   }
   await Promise.all(bots.map((b) => b.connect(WS_URL)));
   pass(`${PLAYER_COUNT} 个客户端已连接`);
@@ -98,6 +100,68 @@ async function main(): Promise<void> {
   assert.equal(seats.size, PLAYER_COUNT, '12 个人应该坐在 12 个不同座位上');
   assert.ok(!seats.has(null), '每个人都应该有座位号');
   pass('12 人入座，座位号互不重复（1-12）');
+
+  // ②·四 版型校验：角色总数不对时必须拦住开局，并告诉房主差多少
+  const badBoard = cloneBoard(presetById('12-classic-white-idiot')!.board);
+  badBoard.roles.VILLAGER = 3; // 总数变成 11，比 12 人少 1
+  host.send({ t: 'room.board', board: badBoard });
+  await waitFor(() => (host.room?.boardErrors.length ?? 0) > 0, 5_000, '版型错误下发');
+  assert.ok(
+    host.room!.boardErrors.some((m) => /少了 1 人/.test(m)),
+    `应提示「少了 1 人」，实际：${host.room!.boardErrors.join(' / ')}`,
+  );
+  assert.equal(host.room!.canStart, false, '版型不合法时不应允许开局');
+  host.send({ t: 'game.start' });
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(host.game, null, '版型不合法时开局应失败');
+  host.errors.length = 0;
+  pass('版型校验：角色总数少 1 人 → 拦住开局并提示「少了 1 人」');
+
+  // 非房主不能改版型
+  bots[1]!.send({ t: 'room.board', board: badBoard });
+  await new Promise((r) => setTimeout(r, 300));
+  assert.ok(
+    bots[1]!.errors.some((e) => e.startsWith('NOT_HOST')),
+    '非房主改版型应被拒绝',
+  );
+  bots[1]!.errors.length = 0;
+  pass('权限校验：非房主不能改版型（NOT_HOST）');
+
+  // 改回合法版型
+  host.send({ t: 'room.board', board: cloneBoard(presetById('12-classic-white-idiot')!.board) });
+  await waitFor(() => (host.room?.boardErrors.length ?? 1) === 0, 5_000, '版型恢复合法');
+  assert.ok(
+    host.room!.boardSummary.includes('预言家'),
+    `版型摘要应包含神职：${host.room!.boardSummary}`,
+  );
+  pass(`改回合法版型：${host.room!.boardSummary}`);
+
+  // ②·五 全员就绪：现在「坐满」不等于「能开局」，还要除房主外所有人点就绪
+  assert.equal(host.room!.canStart, false, '还没人就绪时房主不应该能开局');
+  assert.ok(
+    host.room!.notReadySeats.length === PLAYER_COUNT - 1,
+    `应有 ${PLAYER_COUNT - 1} 人未就绪，实际 ${host.room!.notReadySeats.length}`,
+  );
+
+  // 先让一个人就绪，再验证房主仍然开不了局
+  bots[1]!.send({ t: 'room.ready', ready: true });
+  await waitFor(() => (host.room?.notReadySeats.length ?? 99) === PLAYER_COUNT - 2, 5_000, '1 人就绪');
+  host.send({ t: 'game.start' });
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(host.game, null, '还有人没就绪时不应该能开局');
+  assert.ok(
+    host.errors.some((e) => e.startsWith('NOT_READY')),
+    '未全员就绪时开局应收到 NOT_READY 错误',
+  );
+  host.errors.length = 0;
+  pass('就绪校验：还有人没就绪时房主开不了局（NOT_READY）');
+
+  // 剩下的人全部就绪
+  for (const bot of bots.slice(2)) {
+    bot.send({ t: 'room.ready', ready: true });
+  }
+  await waitFor(() => host.room?.canStart === true, 5_000, '全员就绪');
+  pass('全员就绪后房主可以开局');
 
   // ③ 断线重连：验证 token 能把人放回原座位
   const reconnecting = bots[5]!;
@@ -201,6 +265,112 @@ async function main(): Promise<void> {
   const unexpected = bots.flatMap((b) => b.errors);
   assert.deepEqual(unexpected, [], `出现预期外的错误：\n${unexpected.join('\n')}`);
   pass('全程没有出现预期外的协议错误');
+
+  // ⑩ 第二个场景：白狼王局 —— 把「切版型 + 守卫阶段 + 白狼王自爆带人」的完整链路跑一遍
+  console.log('\n  ── 场景二：12 人白狼王局 ──');
+
+  // 保存第一场并回到同一个大厅；下一次开局应自动成为第 2 场。
+  host.send({ t: 'room.closeMatch' });
+  await waitFor(() => host.room?.status === 'LOBBY', 8_000, '回到大厅');
+
+  host.send({ t: 'room.board', board: cloneBoard(presetById('12-wolf-king')!.board) });
+  await waitFor(() => (host.room?.board.roles.WOLF_KING ?? 0) === 1, 8_000, '切换为白狼王版型');
+  assert.equal(host.room!.board.playerCount, 12);
+  assert.deepEqual(host.room!.boardErrors, [], '白狼王预设不应有校验错误');
+  assert.ok(
+    host.room!.boardSummary.includes('白狼王'),
+    `版型摘要应含白狼王：${host.room!.boardSummary}`,
+  );
+  pass(`版型已切换到白狼王局：${host.room!.boardSummary}`);
+
+  // 换版型会清空就绪状态，需要所有人重新确认（这是有意的：版型都变了）
+  assert.equal(host.room!.canStart, false, '换版型后应需要重新就绪');
+  for (const bot of bots.slice(1)) {
+    bot.send({ t: 'room.ready', ready: true });
+  }
+  await waitFor(() => host.room?.canStart === true, 8_000, '第二局全员就绪');
+  pass('换版型后重新就绪 → 房主可以开局');
+
+  // 只看第二局的观察数据
+  for (const bot of bots) {
+    bot.obs.phasesSeen.clear();
+    bot.errors.length = 0;
+  }
+
+  host.send({ t: 'game.start' });
+  await waitFor(() => bots.every((b) => b.game !== null), 8_000, '第二局发牌');
+
+  const kingBot = bots.find((b) => b.game?.me?.role === 'WOLF_KING');
+  const guardBot = bots.find((b) => b.game?.me?.role === 'GUARD');
+  assert.ok(kingBot, '白狼王局里必须有一名白狼王');
+  assert.ok(guardBot, '白狼王版型里必须有守卫');
+  assert.equal(kingBot.game!.me!.camp, 'WOLF', '白狼王必须是狼人阵营');
+  pass(
+    `第二局牌型抽查：白狼王=${kingBot.nickname}（${kingBot.game!.me!.seat} 号），守卫=${guardBot.nickname}`,
+  );
+
+  await waitFor(
+    () => bots.every((b) => b.game?.phase === 'GAME_OVER'),
+    120_000,
+    '第二局跑完',
+  );
+
+  const finisher = host.game!;
+  const seen2 = new Set<string>();
+  for (const b of bots) for (const p of b.obs.phasesSeen) seen2.add(p);
+
+  /**
+   * 守卫阶段不一定出现：如果守卫第 1 夜就被狼刀死，引擎会**正确地**跳过它。
+   * 所以断言写成「要么出现过守卫阶段，要么守卫确实第 1 夜就出局了」——
+   * 只断言「必须出现」会变成偶发失败（这个坑我踩过一次）。
+   */
+  const guardSeat = guardBot.game!.me!.seat;
+  const guardDiedNight1 = finisher.deaths.some((d) => d.seat === guardSeat && d.day === 1);
+  if (seen2.has('NIGHT_GUARD')) {
+    pass('第二局出现过守卫阶段');
+  } else {
+    assert.ok(
+      guardDiedNight1,
+      `既没看到守卫阶段，守卫（${guardSeat} 号）也不是第 1 天出局的 —— 说明守卫阶段被错误跳过了`,
+    );
+    pass(`守卫（${guardSeat} 号）第 1 天就出局，守卫阶段被正确跳过`);
+  }
+
+  // 诊断信息：万一白狼王没炸成，得能一眼看出是「没活到投票」还是「炸了但被拒」
+  const kingSeat = kingBot.game!.me!.seat;
+  const kingDeath = finisher.deaths.find((d) => d.seat === kingSeat);
+  const kingErrors = kingBot.errors.filter((e) => !e.startsWith('BAD_PHASE'));
+
+  assert.ok(
+    seen2.has('WOLF_KING_BOOM'),
+    `第二局应该出现白狼王自爆阶段，实际出现：${[...seen2].sort().join(', ')}\n` +
+      `  白狼王：${kingSeat} 号\n` +
+      `  出局情况：${kingDeath ? `第 ${kingDeath.day} 天 ${kingDeath.cause}` : '（从未出局）'}\n` +
+      `  该机器人收到的非 BAD_PHASE 错误：${kingErrors.length > 0 ? kingErrors.join(' | ') : '（无）'}`,
+  );
+  pass('第二局白狼王自爆阶段真实发生过');
+  pass('第二局跑完：版型切换、就绪、守卫、自爆带人链路都验证到了');
+
+  assert.ok(finisher.revealAll, '第二局结束后应下发全场身份');
+  assert.equal(finisher.revealAll!.length, 12);
+  const boomRecords = finisher.deaths.filter((d) => d.cause === 'EXPLODE' || d.cause === 'BLAST');
+  assert.ok(boomRecords.length >= 1, '战报里应有「自爆」或「被白狼王带走」的记录');
+  assert.ok(
+    boomRecords.every((d) => typeof d.day === 'number'),
+    '复盘里每条死亡记录都应带「第几天」',
+  );
+  pass(
+    `白狼王链路验证：${boomRecords.length} 条自爆/带走记录（` +
+      boomRecords.map((d) => `${d.seat}号@第${d.day}天`).join('、') +
+      '）',
+  );
+
+  // 第二局里其他玩家可能在自爆之后才提交投票，那是相位已变的正常拒绝
+  const leftover = bots
+    .flatMap((b) => b.errors)
+    .filter((e) => !e.startsWith('BAD_PHASE') && !e.startsWith('ALREADY_DONE'));
+  assert.deepEqual(leftover, [], `第二局出现预期外的错误：\n${leftover.join('\n')}`);
+  pass('第二局没有出现预期外的协议错误（自爆引起的 BAD_PHASE 属正常）');
 
   clearInterval(trailTimer);
   cleanup();

@@ -24,6 +24,11 @@ const MIME: Record<string, string> = {
   '.ico': 'image/x-icon',
   '.woff': 'font/woff',
   '.woff2': 'font/woff2',
+  // 音效（目前只有警长当选的「金色传说」）
+  '.mp3': 'audio/mpeg',
+  '.m4a': 'audio/mp4',
+  '.ogg': 'audio/ogg',
+  '.wav': 'audio/wav',
   '.txt': 'text/plain; charset=utf-8',
   '.map': 'application/json; charset=utf-8',
 };
@@ -99,11 +104,16 @@ export function createStaticHandler(rootDir: string) {
     }
 
     const type = MIME[extname(filePath).toLowerCase()] ?? 'application/octet-stream';
-    // 前端产物带 hash 的可以长缓存；index.html 必须每次校验
+    // 只有文件名里带内容 hash 的产物才能 immutable。
+    // 当前项目的大多数资源（manifest、图标、音效、vendor JS）都没有 hash；
+    // 给它们缓存一年会导致部署更新后手机仍使用旧文件。
     const isHtml = type.startsWith('text/html');
+    const fileName = filePath.split(sep).at(-1) ?? '';
+    const hasContentHash = /\.[a-f0-9]{8,}\./i.test(fileName);
     res.writeHead(200, {
       'content-type': type,
-      'cache-control': isHtml ? 'no-cache' : 'public, max-age=31536000, immutable',
+      'cache-control':
+        !isHtml && hasContentHash ? 'public, max-age=31536000, immutable' : 'no-cache',
     });
     if (req.method === 'HEAD') {
       res.end();

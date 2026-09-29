@@ -5,6 +5,7 @@
 
 import { computed, defineComponent } from '../../vendor/vue.esm-browser.prod.js';
 
+import { isWolfRole } from '../../../src/shared/roles.ts';
 import { canPick, pickSeat, state } from '../store.ts';
 
 export const SeatGrid = defineComponent({
@@ -19,16 +20,16 @@ export const SeatGrid = defineComponent({
 
       return room.seats.map((s) => {
         const dead = game ? s.alive === false : false;
-        const wolfmate = iAmWolf && s.role === 'WOLF' && !s.isMe;
+        const wolfmate = iAmWolf && s.role !== undefined && isWolfRole(s.role) && !s.isMe;
         const pickable = canPick.value && options.includes(s.seat);
-        const selected = state.selected === s.seat;
+        const selected = state.selected === s.seat || state.selectedMany.includes(s.seat);
         const revealedIdiot = s.idiotRevealed === true;
 
         let tag = '';
         let tagClass = 'muted';
         if (s.role) {
           tag = s.roleName ?? '';
-          tagClass = s.role === 'WOLF' ? 'wolf' : 'good';
+          tagClass = isWolfRole(s.role) ? 'wolf' : 'good';
         } else if (revealedIdiot) {
           tag = '白痴·已翻牌';
           tagClass = 'gold';
@@ -59,6 +60,8 @@ export const SeatGrid = defineComponent({
           tag,
           tagClass,
           revealedIdiot,
+          isSheriff: s.isSheriff === true,
+          isSheriffCandidate: game?.sheriffCandidates.includes(s.seat) === true,
         };
       });
     });
@@ -85,6 +88,8 @@ export const SeatGrid = defineComponent({
       >
         <span class="no">{{ s.seat }}</span>
         <span class="name">
+          <span v-if="s.isSheriff" title="警长">🚨</span>
+          <span v-else-if="s.isSheriffCandidate" title="警长候选人">👮</span>
           {{ s.occupied ? s.nickname : '空位' }}
           <template v-if="s.isMe">（我）</template>
         </span>
