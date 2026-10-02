@@ -5,14 +5,8 @@
 
 import { computed, defineComponent } from '../../vendor/vue.esm-browser.prod.js';
 
+import { DEATH_CAUSE_LABEL } from '../../../src/shared/protocol.ts';
 import { askConfirm, closeMatch, isHost, leaveRoom, restartGame, state } from '../store.ts';
-
-const DEATH_CAUSE_LABEL: Record<string, string> = {
-  WOLF: '被狼人杀害',
-  POISON: '被女巫毒杀',
-  VOTE: '被投票放逐',
-  SHOOT: '被猎人带走',
-};
 
 export const ResultView = defineComponent({
   name: 'ResultView',

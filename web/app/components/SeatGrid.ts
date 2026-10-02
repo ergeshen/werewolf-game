@@ -10,7 +10,11 @@ import { canPick, pickSeat, state } from '../store.ts';
 
 export const SeatGrid = defineComponent({
   name: 'SeatGrid',
-  setup() {
+  props: {
+    /** 对局中只有身份牌点开时才允许显示自己/狼队友等私密身份。 */
+    revealPrivateIdentity: { type: Boolean, default: true },
+  },
+  setup(props) {
     const seats = computed(() => {
       const room = state.room;
       if (!room) return [];
@@ -20,14 +24,15 @@ export const SeatGrid = defineComponent({
 
       return room.seats.map((s) => {
         const dead = game ? s.alive === false : false;
-        const wolfmate = iAmWolf && s.role !== undefined && isWolfRole(s.role) && !s.isMe;
+        const wolfmate =
+          props.revealPrivateIdentity && iAmWolf && s.role !== undefined && isWolfRole(s.role) && !s.isMe;
         const pickable = canPick.value && options.includes(s.seat);
         const selected = state.selected === s.seat || state.selectedMany.includes(s.seat);
         const revealedIdiot = s.idiotRevealed === true;
 
         let tag = '';
         let tagClass = 'muted';
-        if (s.role) {
+        if (s.role && props.revealPrivateIdentity) {
           tag = s.roleName ?? '';
           tagClass = isWolfRole(s.role) ? 'wolf' : 'good';
         } else if (revealedIdiot) {
@@ -66,35 +71,51 @@ export const SeatGrid = defineComponent({
       });
     });
 
-    return { seats, pickSeat, state };
-  },
+    /**
+     * 座位数据来自「房间视图」（`state.room.seats`），不是游戏视图。
+     *
+     * 所以房间视图一丢，座位盘就会**整片变空** —— 而它以前是静默变空，
+     * 看起来就像「所有玩家都不见了」，玩家完全不知道发生了什么。
+     * 现在把这种情况显式暴露出来，并提示客户端去重新同步。
+     */
+    const seatsMissing = computed(() => state.room === null);
+    const gameRunning = computed(() => state.game !== null);
 
+    return { seats, seatsMissing, gameRunning, pickSeat, state };
+  },
   template: `
-    <div class="seats">
-      <div
-        v-for="s in seats"
-        :key="s.seat"
-        class="seat"
-        :class="{
-          empty: !s.occupied,
-          me: s.isMe,
-          dead: s.dead,
-          wolfmate: s.wolfmate,
-          pickable: s.pickable,
-          selected: s.selected,
-          'idiot-revealed': s.revealedIdiot,
-        }"
-        @click="s.pickable && pickSeat(s.seat)"
-      >
-        <span class="no">{{ s.seat }}</span>
-        <span class="name">
-          <span v-if="s.isSheriff" title="警长">🚨</span>
-          <span v-else-if="s.isSheriffCandidate" title="警长候选人">👮</span>
-          {{ s.occupied ? s.nickname : '空位' }}
-          <template v-if="s.isMe">（我）</template>
-        </span>
-        <span v-if="s.tag" class="tag" :class="'badge ' + (s.tagClass === 'muted' ? '' : s.tagClass)">{{ s.tag }}</span>
-        <span v-else-if="s.occupied && !s.online" class="tag badge warn">离线</span>
+    <div>
+      <!-- 房间信息丢了但牌局还在：这不该是「12 个空位」这种看不懂的画面 -->
+      <div v-if="seatsMissing && gameRunning" class="banner warn">
+        正在重新同步房间信息…牌局还在，稍等一下；如果一直是这样，请刷新页面。
+      </div>
+
+      <div class="seats">
+        <div
+          v-for="s in seats"
+          :key="s.seat"
+          class="seat"
+          :class="{
+            empty: !s.occupied,
+            me: s.isMe,
+            dead: s.dead,
+            wolfmate: s.wolfmate,
+            pickable: s.pickable,
+            selected: s.selected,
+            'idiot-revealed': s.revealedIdiot,
+          }"
+          @click="s.pickable && pickSeat(s.seat)"
+        >
+          <span class="no">{{ s.seat }}</span>
+          <span class="name">
+            <span v-if="s.isSheriff" title="警长">🚨</span>
+            <span v-else-if="s.isSheriffCandidate" title="警长候选人">👮</span>
+            {{ s.occupied ? s.nickname : '空位' }}
+            <template v-if="s.isMe">（我）</template>
+          </span>
+          <span v-if="s.tag" class="tag" :class="'badge ' + (s.tagClass === 'muted' ? '' : s.tagClass)">{{ s.tag }}</span>
+          <span v-else-if="s.occupied && !s.online" class="tag badge warn">离线</span>
+        </div>
       </div>
     </div>
   `,

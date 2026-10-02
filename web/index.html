@@ -336,15 +336,38 @@
         margin-bottom: 12px;
         border: 1px solid var(--border);
         background: linear-gradient(135deg, #1c2236, #141826);
+        transition: border-color 120ms ease, background 120ms ease;
       }
-      .rolecard.wolf {
-        border-color: rgba(224, 69, 94, 0.55);
-        background: linear-gradient(135deg, #2a1720, #1a1016);
+      .rolecard.revealed {
+        border-color: rgba(104, 137, 216, 0.58);
+        background: linear-gradient(135deg, #202942, #171d2d);
       }
       .rolecard .role {
         font-size: 22px;
         font-weight: 700;
         letter-spacing: 2px;
+        color: #dce5ff;
+      }
+      .rolecard .role-hidden {
+        color: #8b93ad;
+        letter-spacing: 5px;
+      }
+      .rolecard .identity-seat {
+        color: #c7cee1;
+        border-color: rgba(139, 147, 173, 0.45);
+        background: rgba(139, 147, 173, 0.12);
+      }
+      .role-hold {
+        min-width: 96px;
+        min-height: 42px;
+        touch-action: none;
+        user-select: none;
+        -webkit-user-select: none;
+        -webkit-touch-callout: none;
+      }
+      .role-hold.is-revealed {
+        border-color: rgba(104, 137, 216, 0.72);
+        background: rgba(104, 137, 216, 0.16);
       }
 
       /* ───────── 日志 ───────── */
@@ -517,6 +540,111 @@
         gap: 8px;
         margin-top: 18px;
       }
+
+      /* ───────── 法官音色选择 ─────────
+         12 个人各挑各的（每台手机自己听），所以做成一行一个的单选列表，
+         每行右边带「试听」—— 光看名字挑不出音色，必须点一下听。 */
+      /* 折叠式音色选择：平时只占一行（显示当前用的是哪个），点开才铺开 */
+      .voice-picker-toggle {
+        width: 100%;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 9px 12px;
+        border-radius: 8px;
+        border: 1px solid var(--border);
+        background: var(--panel-3);
+        color: inherit;
+        font-size: 13px;
+        text-align: left;
+        cursor: pointer;
+      }
+      .voice-picker-toggle:hover {
+        border-color: rgba(79, 140, 255, 0.55);
+      }
+      .voice-picker-toggle .grow {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .voice-packs {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+      .voice-pack {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 10px;
+        border-radius: 8px;
+        border: 1px solid var(--border);
+        background: var(--panel-3);
+      }
+      .voice-pack.picked {
+        border-color: rgba(79, 140, 255, 0.75);
+        background: rgba(79, 140, 255, 0.14);
+      }
+      .voice-pack-name {
+        flex: 1;
+        min-width: 0;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 2px 0;
+        background: transparent;
+        border: 0;
+        color: inherit;
+        font-size: 13px;
+        text-align: left;
+        cursor: pointer;
+      }
+      .voice-pack-check {
+        flex-shrink: 0;
+        color: var(--accent, #4f8cff);
+        font-size: 12px;
+      }
+      .voice-pack .tiny-btn {
+        flex-shrink: 0;
+        padding: 3px 10px;
+      }
+
+      /* ───────── 验人结果 ─────────
+         整局最关键的信息（预言家验出谁是狼、通灵师查到具体身份、
+         守墓人查到放逐者阵营……）单独占一块，大号 + 颜色。
+         原来的做法是并进普通面板的小灰字里，标题还写着「已提交」，
+         结果就是玩家以为没验出东西，到白天翻身份牌才发现。 */
+      .result-box {
+        margin-top: 12px;
+        padding: 14px 16px;
+        border-radius: 10px;
+        border: 1px solid var(--border);
+        background: var(--panel-3);
+        text-align: center;
+      }
+      .result-box.tone-wolf {
+        border-color: rgba(224, 69, 94, 0.6);
+        background: rgba(224, 69, 94, 0.13);
+      }
+      .result-box.tone-good {
+        border-color: rgba(52, 199, 148, 0.6);
+        background: rgba(52, 199, 148, 0.13);
+      }
+      .result-box.tone-info {
+        border-color: rgba(79, 140, 255, 0.6);
+        background: rgba(79, 140, 255, 0.13);
+      }
+      .result-value {
+        margin-top: 6px;
+        font-size: 22px;
+        font-weight: 700;
+        line-height: 1.4;
+        word-break: break-word;
+      }
+      .result-box.tone-wolf .result-value { color: #ff8b9d; }
+      .result-box.tone-good .result-value { color: #63dbb2; }
+      .result-box.tone-info .result-value { color: #9dc0ff; }
 
       /* ───────── 开关 ───────── */
       .switch {

@@ -3,7 +3,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import Database from 'libsql';
 
-import type { Outcome } from '../shared/protocol.ts';
+import type { GameMode, MatchReplay, Outcome } from '../shared/protocol.ts';
 import {
   ROLE_NAME,
   isGod,
@@ -53,6 +53,7 @@ export interface MatchHistoryRow {
   score: number;
   matchNumber: number;
   endedPhase: string | null;
+  mode: GameMode;
 }
 
 export type MatchStatus = 'PLAYING' | 'COMPLETED' | 'ABORTED';
@@ -80,7 +81,10 @@ export interface HallMatchRow {
   day: number | null;
   endedPhase: string | null;
   boardSummary: string;
+  mode: GameMode;
   players: HallMatchPlayerRow[];
+  /** 旧场次没有回放数据；非参赛者也不会收到隐藏行动。 */
+  replay: MatchReplay | null;
 }
 
 export interface HallPlayerStats {
@@ -91,16 +95,39 @@ export interface HallPlayerStats {
   wolfCount: number;
   godCount: number;
   villagerCount: number;
-  /** 只有厅主能收到积分与排名。 */
+  /** 厅主、本人或厅主公开最终积分后才会下发。 */
   score?: number;
   rank?: number;
+  goodScore?: number;
+  wolfScore?: number;
+  hexWins: number;
+  hexLosses: number;
+  hexScore?: number;
+  exileCorrect: number;
+  exileVotes: number;
+  exileAccuracy: number;
+  exileEligible: boolean;
 }
 
 export interface HallDashboard {
   roomId: string;
   isOwner: boolean;
+  scoresRevealed: boolean;
   matches: HallMatchRow[];
   players: HallPlayerStats[];
+}
+
+export interface OwnedHallSummary {
+  roomId: string;
+  createdAt: number;
+  updatedAt: number;
+  matchCount: number;
+  completedCount: number;
+}
+
+export interface HallRecordSummary extends OwnedHallSummary {
+  relation: 'OWNER' | 'PARTICIPANT';
+  ownerName: string;
 }
 
 export type AccountReply<T> = { ok: true; value: T } | { ok: false; message: string };
@@ -193,8 +220,20 @@ export class GameDatabase {
       CREATE TABLE IF NOT EXISTS halls (
         id TEXT PRIMARY KEY,
         owner_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
-        created_at INTEGER NOT NULL
+        created_at INTEGER NOT NULL,
+        scores_revealed INTEGER NOT NULL DEFAULT 0
       );
+
+      CREATE TABLE IF NOT EXISTS user_halls (
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        hall_id TEXT NOT NULL REFERENCES halls(id) ON DELETE CASCADE,
+        relation TEXT NOT NULL,
+        first_seen_at INTEGER NOT NULL,
+        last_seen_at INTEGER NOT NULL,
+        hidden_at INTEGER,
+        PRIMARY KEY (user_id, hall_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_user_halls_user ON user_halls(user_id, hidden_at, last_seen_at);
 
       CREATE TABLE IF NOT EXISTS matches (
         id TEXT PRIMARY KEY,
@@ -209,8 +248,10 @@ export class GameDatabase {
         status TEXT NOT NULL DEFAULT 'PLAYING',
         ended_phase TEXT,
         fake_seer_user_id TEXT,
+        replay_json TEXT,
         deleted_at INTEGER,
-        deleted_by_user_id TEXT
+        deleted_by_user_id TEXT,
+        mode TEXT NOT NULL DEFAULT 'STANDARD'
       );
 
       CREATE TABLE IF NOT EXISTS match_players (
@@ -224,6 +265,19 @@ export class GameDatabase {
         PRIMARY KEY (match_id, seat)
       );
       CREATE INDEX IF NOT EXISTS idx_match_players_user ON match_players(user_id);
+
+      CREATE TABLE IF NOT EXISTS role_wishes (
+        user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        loss_streak INTEGER NOT NULL DEFAULT 0,
+        role TEXT,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS room_snapshots (
+        room_id TEXT PRIMARY KEY,
+        payload TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
     `);
 
     // 兼容已经创建过旧版 SQLite 的用户：CREATE TABLE IF NOT EXISTS 不会自动补列。
@@ -231,19 +285,42 @@ export class GameDatabase {
     this.ensureMatchColumn('status', "TEXT NOT NULL DEFAULT 'PLAYING'");
     this.ensureMatchColumn('ended_phase', 'TEXT');
     this.ensureMatchColumn('fake_seer_user_id', 'TEXT');
+    this.ensureMatchColumn('replay_json', 'TEXT');
     this.ensureMatchColumn('deleted_at', 'INTEGER');
     this.ensureMatchColumn('deleted_by_user_id', 'TEXT');
+    this.ensureMatchColumn('mode', "TEXT NOT NULL DEFAULT 'STANDARD'");
+    this.ensureColumn('halls', 'scores_revealed', 'INTEGER NOT NULL DEFAULT 0');
     this.db.exec(`
       UPDATE matches SET status = 'COMPLETED'
       WHERE ended_at IS NOT NULL AND status = 'PLAYING';
       CREATE INDEX IF NOT EXISTS idx_matches_room ON matches(room_id, started_at);
+
+      INSERT OR IGNORE INTO user_halls
+        (user_id, hall_id, relation, first_seen_at, last_seen_at)
+      SELECT owner_user_id, id, 'OWNER', created_at, created_at
+      FROM halls WHERE owner_user_id IS NOT NULL;
+
+      INSERT OR IGNORE INTO user_halls
+        (user_id, hall_id, relation, first_seen_at, last_seen_at)
+      SELECT p.user_id, m.room_id, 'PARTICIPANT', MIN(m.started_at), MAX(COALESCE(m.ended_at, m.started_at))
+      FROM match_players p
+      JOIN matches m ON m.id = p.match_id
+      -- 旧版本允许场次脱离大厅独立保存。user_halls.hall_id 有外键约束，
+      -- 因此只能回填仍然存在的大厅；孤立场次本身继续保留在个人战绩中。
+      JOIN halls h ON h.id = m.room_id
+      WHERE p.user_id IS NOT NULL
+      GROUP BY p.user_id, m.room_id;
     `);
   }
 
   private ensureMatchColumn(name: string, definition: string): void {
-    const columns = this.db.prepare('PRAGMA table_info(matches)').all() as Array<{ name: string }>;
+    this.ensureColumn('matches', name, definition);
+  }
+
+  private ensureColumn(table: string, name: string, definition: string): void {
+    const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
     if (!columns.some((column) => column.name === name)) {
-      this.db.exec(`ALTER TABLE matches ADD COLUMN ${name} ${definition}`);
+      this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`);
     }
   }
 
@@ -355,6 +432,99 @@ export class GameDatabase {
     this.db
       .prepare('INSERT OR IGNORE INTO halls (id, owner_user_id, created_at) VALUES (?, ?, ?)')
       .run(roomId, ownerUserId, Date.now());
+    if (ownerUserId) this.recordHallVisit(roomId, ownerUserId);
+  }
+
+  hallOwnerUserId(roomId: string): string | null {
+    const row = this.db.prepare('SELECT owner_user_id FROM halls WHERE id = ?').get(roomId) as
+      | { owner_user_id: string | null }
+      | undefined;
+    return row?.owner_user_id ?? null;
+  }
+
+  roleWishState(userId: string): { lossStreak: number; role: Role | null } {
+    const row = this.db
+      .prepare('SELECT loss_streak, role FROM role_wishes WHERE user_id = ?')
+      .get(userId) as { loss_streak: number; role: string | null } | undefined;
+    return {
+      lossStreak: Number(row?.loss_streak ?? 0),
+      role: row?.role ? row.role as Role : null,
+    };
+  }
+
+  setRoleWish(userId: string, role: Role | null): AccountReply<null> {
+    const state = this.roleWishState(userId);
+    if (state.lossStreak < 2) return { ok: false, message: '连续输掉两场后才能选择愿望角色' };
+    this.db
+      .prepare(
+        `INSERT INTO role_wishes (user_id, loss_streak, role, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(user_id) DO UPDATE SET role = excluded.role, updated_at = excluded.updated_at`,
+      )
+      .run(userId, state.lossStreak, role, Date.now());
+    return { ok: true, value: null };
+  }
+
+  // ─────────────── 进行中房间快照 ───────────────
+
+  /** 保存（覆盖）一个房间的进行中状态快照。 */
+  saveRoomSnapshot(roomId: string, payload: string): void {
+    this.db
+      .prepare(
+        `INSERT INTO room_snapshots (room_id, payload, updated_at)
+         VALUES (?, ?, ?)
+         ON CONFLICT(room_id) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at`,
+      )
+      .run(roomId, payload, Date.now());
+  }
+
+  loadRoomSnapshots(): Array<{ roomId: string; payload: string; updatedAt: number }> {
+    const rows = this.db
+      .prepare('SELECT room_id, payload, updated_at FROM room_snapshots')
+      .all() as Array<{ room_id: string; payload: string; updated_at: number }>;
+    return rows.map((row) => ({
+      roomId: row.room_id,
+      payload: row.payload,
+      updatedAt: Number(row.updated_at),
+    }));
+  }
+
+  deleteRoomSnapshot(roomId: string): void {
+    this.db.prepare('DELETE FROM room_snapshots WHERE room_id = ?').run(roomId);
+  }
+
+  setHallScoresRevealed(roomId: string, byUserId: string): AccountReply<null> {
+    const result = this.db
+      .prepare('UPDATE halls SET scores_revealed = 1 WHERE id = ? AND owner_user_id = ?')
+      .run(roomId, byUserId);
+    if (Number(result.changes) !== 1) return { ok: false, message: '只有厅主可以公开最终积分' };
+    return { ok: true, value: null };
+  }
+
+  recordHallVisit(roomId: string, userId: string): void {
+    const ownerUserId = this.hallOwnerUserId(roomId);
+    if (ownerUserId === null) return;
+    const now = Date.now();
+    const relation = ownerUserId === userId ? 'OWNER' : 'PARTICIPANT';
+    this.db
+      .prepare(
+        `INSERT INTO user_halls
+           (user_id, hall_id, relation, first_seen_at, last_seen_at, hidden_at)
+         VALUES (?, ?, ?, ?, ?, NULL)
+         ON CONFLICT(user_id, hall_id) DO UPDATE SET
+           relation = CASE WHEN excluded.relation = 'OWNER' THEN 'OWNER' ELSE user_halls.relation END,
+           last_seen_at = excluded.last_seen_at,
+           hidden_at = NULL`,
+      )
+      .run(userId, roomId, relation, now, now);
+  }
+
+  hideHallRecord(roomId: string, userId: string): AccountReply<null> {
+    const result = this.db
+      .prepare('UPDATE user_halls SET hidden_at = ? WHERE user_id = ? AND hall_id = ? AND hidden_at IS NULL')
+      .run(Date.now(), userId, roomId);
+    if (Number(result.changes) !== 1) return { ok: false, message: '没有找到这条大厅记录' };
+    return { ok: true, value: null };
   }
 
   nextMatchNumber(roomId: string): number {
@@ -372,6 +542,7 @@ export class GameDatabase {
     board: BoardConfig,
     boardSummary: string,
     players: MatchParticipantInput[],
+    mode: GameMode = 'STANDARD',
   ): string {
     const id = randomUUID();
     const matchNumber = this.nextMatchNumber(roomId);
@@ -380,10 +551,10 @@ export class GameDatabase {
       this.db
         .prepare(
           `INSERT INTO matches
-           (id, room_id, match_number, board_json, board_summary, started_at, status)
-           VALUES (?, ?, ?, ?, ?, ?, 'PLAYING')`,
+           (id, room_id, match_number, board_json, board_summary, started_at, status, mode)
+           VALUES (?, ?, ?, ?, ?, ?, 'PLAYING', ?)`,
         )
-        .run(id, roomId, matchNumber, JSON.stringify(board), boardSummary, Date.now());
+        .run(id, roomId, matchNumber, JSON.stringify(board), boardSummary, Date.now(), mode);
       const insertPlayer = this.db.prepare(
         `INSERT INTO match_players (match_id, user_id, nickname, seat, role, camp)
          VALUES (?, ?, ?, ?, ?, ?)`,
@@ -412,6 +583,7 @@ export class GameDatabase {
     day: number,
     fakeSeerUserId: string | null,
     finalCamps: ReadonlyArray<{ seat: number; camp: Camp }> = [],
+    replay: MatchReplay | null = null,
   ): void {
     this.db.exec('BEGIN IMMEDIATE');
     try {
@@ -419,10 +591,10 @@ export class GameDatabase {
         .prepare(
           `UPDATE matches
            SET ended_at = ?, outcome = ?, day = ?, status = 'COMPLETED',
-               ended_phase = 'GAME_OVER', fake_seer_user_id = ?
+               ended_phase = 'GAME_OVER', fake_seer_user_id = ?, replay_json = ?
            WHERE id = ? AND ended_at IS NULL`,
         )
-        .run(Date.now(), outcome, day, fakeSeerUserId, id);
+        .run(Date.now(), outcome, day, fakeSeerUserId, replay ? JSON.stringify(replay) : null, id);
       const updateCamp = this.db.prepare('UPDATE match_players SET camp = ? WHERE match_id = ? AND seat = ?');
       for (const entry of finalCamps) updateCamp.run(entry.camp, id, entry.seat);
       if (outcome === 'DRAW') {
@@ -432,6 +604,7 @@ export class GameDatabase {
           .prepare('UPDATE match_players SET won = CASE WHEN camp = ? THEN 1 ELSE 0 END WHERE match_id = ?')
           .run(outcome, id);
       }
+      this.updateRoleWishesForFinishedMatch(id, outcome);
       this.db.exec('COMMIT');
     } catch (error) {
       this.db.exec('ROLLBACK');
@@ -439,14 +612,44 @@ export class GameDatabase {
     }
   }
 
-  abortMatch(id: string, day: number, phase: string): void {
+  /** 普通模式才改变连败；海克斯结果会完整保存，但冻结这条进度。 */
+  private updateRoleWishesForFinishedMatch(matchId: string, outcome: Outcome): void {
+    if (outcome === 'DRAW') return;
+    const match = this.db.prepare('SELECT mode FROM matches WHERE id = ?').get(matchId) as
+      | { mode: string }
+      | undefined;
+    if (!match || match.mode === 'HEX_CHAOS') return;
+    const players = this.db
+      .prepare('SELECT user_id, role, won FROM match_players WHERE match_id = ? AND user_id IS NOT NULL')
+      .all(matchId) as Array<{ user_id: string; role: Role; won: number }>;
+    const upsert = this.db.prepare(
+      `INSERT INTO role_wishes (user_id, loss_streak, role, updated_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(user_id) DO UPDATE SET
+         loss_streak = excluded.loss_streak,
+         role = excluded.role,
+         updated_at = excluded.updated_at`,
+    );
+    for (const player of players) {
+      const state = this.roleWishState(player.user_id);
+      const wishGranted = state.role !== null && state.role === player.role;
+      if (Number(player.won) === 1 || wishGranted) {
+        upsert.run(player.user_id, 0, null, Date.now());
+      } else {
+        upsert.run(player.user_id, state.lossStreak + 1, state.role, Date.now());
+      }
+    }
+  }
+
+  abortMatch(id: string, day: number, phase: string, replay: MatchReplay | null = null): void {
     this.db
       .prepare(
         `UPDATE matches
          SET ended_at = ?, day = ?, status = 'ABORTED', ended_phase = ?, outcome = NULL
+             , replay_json = ?
          WHERE id = ? AND ended_at IS NULL`,
       )
-      .run(Date.now(), day, phase, id);
+      .run(Date.now(), day, phase, replay ? JSON.stringify(replay) : null, id);
   }
 
   /** 重新发牌时旧牌局完全作废，不占场次、不进入任何列表。 */
@@ -458,7 +661,7 @@ export class GameDatabase {
     return this.db
       .prepare(
         `SELECT m.id, m.room_id, m.match_number, m.started_at, m.ended_at, m.outcome, m.day,
-                m.board_summary, m.status, m.ended_phase, m.fake_seer_user_id,
+                m.board_summary, m.status, m.ended_phase, m.fake_seer_user_id, m.mode,
                 p.user_id, p.seat, p.role, p.camp, p.won
          FROM match_players p
          JOIN matches m ON m.id = p.match_id
@@ -487,27 +690,90 @@ export class GameDatabase {
           score: this.scoreFor(row, String(row['user_id'])),
           matchNumber: Number(row['match_number'] ?? 0),
           endedPhase: row['ended_phase'] === null ? null : String(row['ended_phase']),
+          mode: row['mode'] === 'HEX_CHAOS' ? 'HEX_CHAOS' : 'STANDARD',
         };
       });
   }
 
+  /** 厅主首页：最近创建/进行过游戏的大厅，和实时房间是否还在内存中无关。 */
+  ownedHalls(userId: string, limit = 20): OwnedHallSummary[] {
+    return (
+      this.db
+        .prepare(
+          `SELECT h.id AS room_id, h.created_at,
+                  MAX(COALESCE(m.ended_at, m.started_at, h.created_at)) AS updated_at,
+                  COUNT(m.id) AS match_count,
+                  SUM(CASE WHEN m.status = 'COMPLETED' THEN 1 ELSE 0 END) AS completed_count
+           FROM halls h
+           LEFT JOIN matches m
+             ON m.room_id = h.id
+            AND m.deleted_at IS NULL
+            AND m.status != 'PLAYING'
+           WHERE h.owner_user_id = ?
+           GROUP BY h.id, h.created_at
+           ORDER BY updated_at DESC
+           LIMIT ?`,
+        )
+        .all(userId, Math.min(Math.max(limit, 1), 20)) as Array<Record<string, string | number | null>>
+    ).map((row) => ({
+      roomId: String(row['room_id']),
+      createdAt: Number(row['created_at']),
+      updatedAt: Number(row['updated_at']),
+      matchCount: Number(row['match_count']),
+      completedCount: Number(row['completed_count'] ?? 0),
+    }));
+  }
+
+  hallRecords(userId: string, limit = 40): HallRecordSummary[] {
+    return (
+      this.db
+        .prepare(
+          `SELECT h.id AS room_id, h.created_at, uh.relation, owner.username AS owner_name,
+                  MAX(COALESCE(m.ended_at, m.started_at, uh.last_seen_at, h.created_at)) AS updated_at,
+                  COUNT(m.id) AS match_count,
+                  SUM(CASE WHEN m.status = 'COMPLETED' THEN 1 ELSE 0 END) AS completed_count
+           FROM user_halls uh
+           JOIN halls h ON h.id = uh.hall_id
+           LEFT JOIN users owner ON owner.id = h.owner_user_id
+           LEFT JOIN matches m
+             ON m.room_id = h.id
+            AND m.deleted_at IS NULL
+            AND m.status != 'PLAYING'
+           WHERE uh.user_id = ? AND uh.hidden_at IS NULL
+           GROUP BY h.id, h.created_at, uh.relation, owner.username, uh.last_seen_at
+           ORDER BY updated_at DESC
+           LIMIT ?`,
+        )
+        .all(userId, Math.min(Math.max(limit, 1), 40)) as Array<Record<string, string | number | null>>
+    ).map((row) => ({
+      roomId: String(row['room_id']),
+      createdAt: Number(row['created_at']),
+      updatedAt: Number(row['updated_at']),
+      matchCount: Number(row['match_count']),
+      completedCount: Number(row['completed_count'] ?? 0),
+      relation: row['relation'] === 'OWNER' ? 'OWNER' : 'PARTICIPANT',
+      ownerName: row['owner_name'] === null ? '未知厅主' : String(row['owner_name']),
+    }));
+  }
+
   hallDashboard(roomId: string, viewerUserId: string): HallDashboard | null {
     const hall = this.db
-      .prepare('SELECT owner_user_id FROM halls WHERE id = ?')
-      .get(roomId) as { owner_user_id: string | null } | undefined;
+      .prepare('SELECT owner_user_id, scores_revealed FROM halls WHERE id = ?')
+      .get(roomId) as { owner_user_id: string | null; scores_revealed: number } | undefined;
     if (!hall) return null;
     const isOwner = hall.owner_user_id === viewerUserId;
+    const scoresRevealed = Number(hall.scores_revealed) === 1;
     const matchRows = this.db
       .prepare(
         `SELECT id, started_at, ended_at, outcome, day, board_summary, status,
-                ended_phase, fake_seer_user_id
+                ended_phase, fake_seer_user_id, replay_json, mode
          FROM matches
          WHERE room_id = ? AND deleted_at IS NULL AND status != 'PLAYING'
          ORDER BY started_at ASC`,
       )
       .all(roomId) as Array<Record<string, string | number | null>>;
 
-    const stats = new Map<string, HallPlayerStats & { rawScore: number }>();
+    const stats = new Map<string, HallPlayerStats & { rawScore: number; rawHexScore: number }>();
     const matches: HallMatchRow[] = matchRows.map((match, index) => {
       const players = (
         this.db
@@ -533,14 +799,32 @@ export class GameDatabase {
             godCount: 0,
             villagerCount: 0,
             rawScore: 0,
+            rawHexScore: 0,
+            goodScore: 0,
+            wolfScore: 0,
+            hexWins: 0,
+            hexLosses: 0,
+            exileCorrect: 0,
+            exileVotes: 0,
+            exileAccuracy: 0,
+            exileEligible: false,
           };
           const won = Number(player['won']) === 1;
-          if (won) current.wins += 1;
-          else current.losses += 1;
+          const hex = match['mode'] === 'HEX_CHAOS';
+          if (hex) {
+            if (won) current.hexWins += 1;
+            else current.hexLosses += 1;
+            current.rawHexScore += score;
+          } else {
+            if (won) current.wins += 1;
+            else current.losses += 1;
+            current.rawScore += score;
+            if (player['camp'] === 'WOLF') current.wolfScore = (current.wolfScore ?? 0) + score;
+            else current.goodScore = (current.goodScore ?? 0) + score;
+          }
           if (isWolfRole(role)) current.wolfCount += 1;
           else if (role === 'VILLAGER' || role === 'HYBRID') current.villagerCount += 1;
           else if (isGod(role)) current.godCount += 1;
-          current.rawScore += score;
           stats.set(key, current);
         }
         const publicPlayer = {
@@ -554,8 +838,25 @@ export class GameDatabase {
           fakeSeer: match['fake_seer_user_id'] !== null &&
             String(match['fake_seer_user_id']) === userId,
         };
-        return isOwner ? { ...publicPlayer, score } : publicPlayer;
+        return isOwner || scoresRevealed || userId === viewerUserId ? { ...publicPlayer, score } : publicPlayer;
       });
+      const participated = players.some((player) => player.userId === viewerUserId);
+      const replay = this.parseReplay(match['replay_json']);
+      if (match['status'] === 'COMPLETED' && match['mode'] !== 'HEX_CHAOS' && replay?.dayVotes) {
+        for (const round of replay.dayVotes) {
+          for (const vote of round.votes) {
+            if (vote.target === null) continue;
+            const voter = players.find((player) => player.seat === vote.voter);
+            const target = players.find((player) => player.seat === vote.target);
+            if (!voter || !target) continue;
+            const key = voter.userId ?? `guest:${voter.nickname}`;
+            const current = stats.get(key);
+            if (!current) continue;
+            current.exileVotes += 1;
+            if (isWolfRole(target.role)) current.exileCorrect += 1;
+          }
+        }
+      }
       return {
         id: String(match['id']),
         displayNumber: index + 1,
@@ -566,17 +867,42 @@ export class GameDatabase {
         day: match['day'] === null ? null : Number(match['day']),
         endedPhase: match['ended_phase'] === null ? null : String(match['ended_phase']),
         boardSummary: String(match['board_summary']),
+        mode: match['mode'] === 'HEX_CHAOS' ? 'HEX_CHAOS' : 'STANDARD',
         players,
+        replay: isOwner || participated ? replay : null,
       };
     });
 
-    const players = [...stats.values()]
-      .sort((a, b) => b.rawScore - a.rawScore || b.wins - a.wins || a.nickname.localeCompare(b.nickname))
-      .map((entry, index) => {
-        const { rawScore, ...publicEntry } = entry;
-        return isOwner ? { ...publicEntry, score: rawScore, rank: index + 1 } : publicEntry;
+    const rankedEntries = [...stats.values()]
+      .sort((a, b) => b.rawScore - a.rawScore || b.wins - a.wins || a.nickname.localeCompare(b.nickname));
+    const ranks = new Map(rankedEntries.map((entry, index) => [entry.userId ?? `guest:${entry.nickname}`, index + 1]));
+    // 未公开时绝不能继续按隐藏积分返回，否则仅看 JSON 数组顺序也能推断排行榜。
+    const visibleOrder = isOwner || scoresRevealed
+      ? rankedEntries
+      : [...rankedEntries].sort((a, b) => b.wins - a.wins || a.losses - b.losses || a.nickname.localeCompare(b.nickname));
+    const players = visibleOrder
+      .map((entry): HallPlayerStats => {
+        const { rawScore, rawHexScore, ...publicEntry } = entry;
+        const canSeeScore = isOwner || scoresRevealed || entry.userId === viewerUserId;
+        const base: HallPlayerStats = {
+          ...publicEntry,
+          exileAccuracy: publicEntry.exileVotes === 0
+            ? 0
+            : Math.round((publicEntry.exileCorrect / publicEntry.exileVotes) * 10_000) / 100,
+          exileEligible: publicEntry.exileVotes >= 3,
+        };
+        return canSeeScore
+          ? {
+              ...base,
+              score: rawScore,
+              rank: ranks.get(entry.userId ?? `guest:${entry.nickname}`),
+              goodScore: entry.goodScore,
+              wolfScore: entry.wolfScore,
+              hexScore: rawHexScore,
+            }
+          : base;
       });
-    return { roomId, isOwner, matches, players };
+    return { roomId, isOwner, scoresRevealed, matches, players };
   }
 
   deleteHallMatch(roomId: string, matchId: string, byUserId: string): AccountReply<null> {
@@ -608,6 +934,18 @@ export class GameDatabase {
     }
     if (outcome === 'GOOD') return camp === 'GOOD' ? 1.5 : 0.5;
     return 0;
+  }
+
+  private parseReplay(value: string | number | null | undefined): MatchReplay | null {
+    if (typeof value !== 'string' || value.length === 0) return null;
+    try {
+      const parsed = JSON.parse(value) as Partial<MatchReplay>;
+      if (parsed.version !== 1 || !Array.isArray(parsed.nights)) return null;
+      return parsed as MatchReplay;
+    } catch {
+      // 单条损坏的旧数据不应让整个大厅页面打不开。
+      return null;
+    }
   }
 
   private createSession(user: AccountUser): AuthResult {

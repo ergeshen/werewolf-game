@@ -69,6 +69,8 @@ const countdownsSeen = new Map<string, number[]>();
  */
 const bots: BotClient[] = [
   new BotClient('房主', {
+    // 这里房主也是机器人，没别人替他按「天黑请闭眼」
+    autoBeginNight: true,
     onUpdate: (self) => {
       const game = self.game;
       if (!game) return;

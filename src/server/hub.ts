@@ -14,12 +14,14 @@
 import { randomUUID } from 'node:crypto';
 import { WebSocket } from 'ws';
 
-import { Game, PHASE_TIMEOUT_MS } from '../shared/engine.ts';
+import { Game, PHASE_TIMEOUT_MS, type GameSnapshot } from '../shared/engine.ts';
 import { GameDatabase, type AccountUser } from './database.ts';
 import {
   DEFAULT_ROOM_CONFIG,
   ERR,
+  NIGHT_ROLE_PHASE_LIST,
   type ClientMsg,
+  type GameMode,
   type NightAction,
   type Phase,
   type RoomConfig,
@@ -37,7 +39,11 @@ import {
   boardWarnings,
   cloneBoard,
   defaultBoard,
+  makeBoard,
+  ROLE_CAMP,
+  ROLE_NAME,
   type BoardConfig,
+  type Role,
 } from '../shared/roles.ts';
 
 export interface Reply {
@@ -112,20 +118,22 @@ function send(socket: WebSocket | null, msg: ServerMsg): void {
  * 这些回合如果「行动一提交就推进」，机器人瞬间出牌会让四个回合在几十毫秒内跑完，
  * 语音根本来不及播报。所以服务端在整段战术时间里按住引擎（holdAdvance），
  * 只在**最后 5 秒**做 54321 倒数提醒 —— 倒数是提醒，不是终止信号。
+ *
+ * 清单来自协议层（`NIGHT_ROLE_PHASE_LIST`），不再手写 ——
+ * 手写的那版在加了狼美人之后就漏了新阶段，那个阶段会变成「一提交就跳过」，
+ * 语音根本来不及念。
  */
-const NIGHT_ROLE_PHASES: ReadonlySet<Phase> = new Set<Phase>([
-  'NIGHT_HYBRID',
-  'NIGHT_MECHANICAL',
-  'NIGHT_DANCER',
-  'NIGHT_MASK',
-  'NIGHT_WOLVES',
-  'NIGHT_GUARD',
-  'NIGHT_WITCH',
-  'NIGHT_SEER',
-  'NIGHT_SPIRIT_SEER',
-]);
+const NIGHT_ROLE_PHASES: ReadonlySet<Phase> = new Set<Phase>(NIGHT_ROLE_PHASE_LIST);
 
+/**
+ * 「在等人操作」的阶段 —— 房主掉线 60 秒后把操作权临时移交给别人。
+ *
+ * `ROLE_REVEAL` 必须在这个集合里：身份确认是**硬门槛**（在线的人全部确认，
+ * 房主才能按「天黑请闭眼」），而它又没有计时器。如果房主恰好在这个阶段掉线、
+ * 又不做移交，全场就会永久锁死在「等房主按按钮」上 —— 没有任何超时能救。
+ */
 const DAYTIME_PHASES: ReadonlySet<Phase> = new Set<Phase>([
+  'ROLE_REVEAL',
   'DAY_ANNOUNCE',
   'SHERIFF_SIGNUP',
   'SHERIFF_CAMPAIGN',
@@ -144,6 +152,56 @@ const HOST_FAILOVER_MS = 60_000;
 
 /** 倒数提醒窗口：阶段结束前最后 5 秒开始念数字 */
 const COUNTDOWN_WINDOW_MS = 5_000;
+const HEX_DRAFT_MS = 45_000;
+
+/**
+ * 房间快照格式版本。改 Room 字段语义 / 删字段时必须 bump；
+ * 版本不符的快照在恢复时整体丢弃（宁可丢一局，不能加载出错乱的房间）。
+ */
+const ROOM_SNAPSHOT_VERSION = 1;
+
+/**
+ * 房间的完整存档（纯 JSON）。含座位上的 token → 用户映射，
+ * 重启后据此重建会话，老 token 重连即可落回原座位。
+ */
+interface RoomSnapshot {
+  v: number;
+  id: string;
+  createdAt: number;
+  config: RoomConfig;
+  seats: (string | null)[];
+  ready: string[];
+  primaryHostToken: string;
+  hostToken: string;
+  hostTemporary: boolean;
+  ownerUserId: string | null;
+  matchNumber: number;
+  matchId: string | null;
+  matchFinished: boolean;
+  fakeSeerToken: string | null;
+  board: BoardConfig;
+  mode: GameMode;
+  hexDraft: [string, { options: Role[]; selected: Role | null }][] | null;
+  hexDraftDeadline: number;
+  game: GameSnapshot | null;
+  /** 座位 token → 身份信息（会话在内存里，重启即失，必须随快照走） */
+  seatSessions: Record<string, { userId: string | null; nickname: string; avatar: string }>;
+}
+
+function shuffled<T>(items: readonly T[]): T[] {
+  const out = items.slice();
+  for (let i = out.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [out[i], out[j]] = [out[j]!, out[i]!];
+  }
+  return out;
+}
+
+function boardFromDeck(roles: readonly Role[]): BoardConfig {
+  const counts: Partial<Record<Role, number>> = {};
+  for (const role of roles) counts[role] = (counts[role] ?? 0) + 1;
+  return makeBoard(roles.length, counts);
+}
 
 export class Room {
   readonly id: string;
@@ -183,6 +241,12 @@ export class Room {
   private phaseTicker: NodeJS.Timeout | null = null;
   /** 当前版型（房主可改） */
   private board: BoardConfig = defaultBoard();
+  private mode: GameMode = 'STANDARD';
+  private hexDraft: Map<string, { options: Role[]; selected: Role | null }> | null = null;
+  private hexDraftDeadline = 0;
+  private hexDraftTimer: NodeJS.Timeout | null = null;
+  /** 有一个挂起的落库任务（setImmediate 合并连发广播，避免每个动作都写一次盘） */
+  private persistQueued = false;
 
   constructor(hub: Hub, id: string, hostToken: string, ownerUserId: string | null) {
     this.hub = hub;
@@ -196,7 +260,180 @@ export class Room {
   }
 
   get playing(): boolean {
-    return this.game !== null;
+    return this.game !== null || this.hexDraft !== null;
+  }
+
+  // ─────────────── 快照与恢复（进行中房间持久化） ───────────────
+
+  /**
+   * 导出整间房间的纯 JSON 存档：座位、版型、模式、海克斯选牌、对局引擎全套状态。
+   *
+   * 注意：快照含**上帝视角**的游戏状态（所有人的身份），只允许写进数据库，
+   * 绝不能发给任何客户端 —— 个性化视图仍然由 gameViewFor 按人裁剪。
+   */
+  snapshot(): RoomSnapshot {
+    const seatSessions: RoomSnapshot['seatSessions'] = {};
+    const tokens = new Set<string>(this.seats.filter((s): s is string => s !== null));
+    for (const extra of [this.primaryHostToken, this.hostToken, this.fakeSeerToken]) {
+      if (extra) tokens.add(extra);
+    }
+    if (this.hexDraft) for (const token of this.hexDraft.keys()) tokens.add(token);
+    for (const token of tokens) {
+      const session = this.hub.get(token);
+      seatSessions[token] = {
+        userId: session?.userId ?? null,
+        nickname: session?.nickname ?? '',
+        avatar: session?.avatar ?? '',
+      };
+    }
+    return {
+      v: ROOM_SNAPSHOT_VERSION,
+      id: this.id,
+      createdAt: this.createdAt,
+      config: { ...this.config },
+      seats: [...this.seats],
+      ready: [...this.ready],
+      primaryHostToken: this.primaryHostToken,
+      hostToken: this.hostToken,
+      hostTemporary: this.hostTemporary,
+      ownerUserId: this.ownerUserId,
+      matchNumber: this.matchNumber,
+      matchId: this.matchId,
+      matchFinished: this.matchFinished,
+      fakeSeerToken: this.fakeSeerToken,
+      board: cloneBoard(this.board),
+      mode: this.mode,
+      hexDraft: this.hexDraft
+        ? [...this.hexDraft.entries()].map(([token, entry]) => [
+          token,
+          { options: [...entry.options], selected: entry.selected },
+        ])
+        : null,
+      hexDraftDeadline: this.hexDraftDeadline,
+      game: this.game ? this.game.snapshot() : null,
+      seatSessions,
+    };
+  }
+
+  /**
+   * 从快照重建房间。**不走构造函数**：构造函数会写大厅表、读场次号，
+   * 恢复时这些都已经存在，重复执行反而会覆盖数据。
+   *
+   * 恢复内容有任何问题（版本不符、结构损坏、对局引擎恢复失败）都返回 null，
+   * 调用方应当丢弃这份快照。
+   */
+  static restore(hub: Hub, roomId: string, payload: string): Room | null {
+    let input: unknown;
+    try {
+      input = JSON.parse(payload);
+    } catch {
+      return null;
+    }
+    if (typeof input !== 'object' || input === null) return null;
+    const snap = input as Partial<RoomSnapshot>;
+    if (snap.v !== ROOM_SNAPSHOT_VERSION) return null;
+    if (snap.id !== roomId) return null;
+    if (!Array.isArray(snap.seats)) return null;
+    const game = snap.game ? Game.restore(snap.game) : null;
+    if (snap.game && !game) return null; // 对局存在却恢复不了 → 整间丢弃，不能丢掉对局只留空壳
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- readonly 字段只能绕过类型系统一次性写入
+    const room: any = Object.create(Room.prototype);
+    room.hub = hub;
+    room.id = roomId;
+    room.createdAt = Number(snap.createdAt) || Date.now();
+    room.config = { ...DEFAULT_ROOM_CONFIG, ...(snap.config ?? {}) };
+    room.seats = [...snap.seats];
+    room.ready = new Set<string>(snap.ready ?? []);
+    room.primaryHostToken = snap.primaryHostToken ?? snap.seats.find((s) => s !== null) ?? '';
+    room.hostToken = snap.hostToken ?? room.primaryHostToken;
+    room.hostTemporary = snap.hostTemporary === true;
+    room.hostFailoverTimer = null;
+    room.ownerUserId = snap.ownerUserId ?? null;
+    room.matchNumber = snap.matchNumber ?? 1;
+    room.scheduledKey = '';
+    room.game = game;
+    room.matchId = snap.matchId ?? null;
+    room.matchFinished = snap.matchFinished === true;
+    room.fakeSeerToken = snap.fakeSeerToken ?? null;
+    room.timer = null;
+    room.phaseEnteredAt = Date.now();
+    room.phaseTicker = null;
+    room.board = snap.board ? cloneBoard(snap.board) : defaultBoard();
+    room.mode = snap.mode === 'HEX_CHAOS' ? 'HEX_CHAOS' : 'STANDARD';
+    room.hexDraft = Array.isArray(snap.hexDraft)
+      ? new Map(snap.hexDraft.map(([token, entry]) => [token, { ...entry }]))
+      : null;
+    room.hexDraftDeadline = snap.hexDraftDeadline ?? 0;
+    room.hexDraftTimer = null;
+    room.persistQueued = false;
+
+    room.restoreSessions(snap.seatSessions ?? {});
+    room.resumeFromSnapshot(Date.now());
+    return room as Room;
+  }
+
+  /** 为快照里的所有 token 重建「离线会话」：老 token 重连即可落回原座位。 */
+  private restoreSessions(seatSessions: RoomSnapshot['seatSessions']): void {
+    const tokens = new Set<string>(this.seats.filter((s): s is string => s !== null));
+    for (const extra of [this.primaryHostToken, this.hostToken, this.fakeSeerToken]) {
+      if (extra) tokens.add(extra);
+    }
+    if (this.hexDraft) for (const token of this.hexDraft.keys()) tokens.add(token);
+    for (const token of tokens) {
+      const info = seatSessions[token];
+      const session = this.hub.ensureSession(token);
+      if (info) {
+        // 真实身份在重连时由登录会话重新核定（attach），这里只是先放一个
+        // 「能被认出来的占位」，让 resync/广播找得到人。
+        session.userId = info.userId;
+        session.nickname = info.nickname;
+        session.avatar = info.avatar;
+      }
+      session.roomId = this.id;
+    }
+  }
+
+  /**
+   * 恢复后的定时器重锚。原则：**停机期间流逝的时间和真实对局一样有效**。
+   *
+   * - 停机期间已到点的阶段，按「超时」结算一次（引擎的挂机自动处理，
+   *   也就是服务端一直在线时会发生的同一件事）；
+   * - 之后 afterChange() → reschedule() 会给当前阶段重新挂一个**完整时长**的
+   *   新定时器 —— 重启对玩家表现为「这一阶段重新计时」，公平且实现简单。
+   */
+  private resumeFromSnapshot(now: number): void {
+    if (this.hexDraft) {
+      const remaining = this.hexDraftDeadline - now;
+      if (remaining <= 0) {
+        this.finishHexDraft();
+        return; // finishHexDraft → launchGame → afterChange，已经处理完一切
+      }
+      this.clearHexDraftTimer();
+      this.hexDraftTimer = setTimeout(() => this.finishHexDraft(), remaining);
+    }
+    const game = this.game;
+    if (game && game.phase !== 'GAME_OVER' && game.deadline !== null && game.deadline <= now) {
+      game.forceAdvance();
+    }
+    this.afterChange();
+  }
+
+  /** 把当前房间状态异步落库（setImmediate 合并同一轮事件里的多次变更）。 */
+  private queuePersist(): void {
+    if (this.persistQueued) return;
+    this.persistQueued = true;
+    setImmediate(() => {
+      this.persistQueued = false;
+      // 房间已销毁（空房清理 / 主动关闭）就不再写盘，销毁路径自己会删快照
+      if (!this.hub.isHallActive(this.id)) return;
+      try {
+        this.hub.database.saveRoomSnapshot(this.id, JSON.stringify(this.snapshot()));
+      } catch (error) {
+        // 落库失败不影响对局继续；下一次状态变化会再试
+        console.error(`保存房间 ${this.id} 的快照失败：`, error);
+      }
+    });
   }
 
   /** 本局生效的座位数 */
@@ -239,6 +476,8 @@ export class Room {
     }
     this.seats[free] = token;
     this.hub.get(token)!.roomId = this.id;
+    const userId = this.hub.get(token)?.userId;
+    if (userId) this.hub.database.recordHallVisit(this.id, userId);
     this.afterChange();
     return OK;
   }
@@ -248,6 +487,12 @@ export class Room {
     if (idx === -1) return;
     this.seats[idx] = null;
     this.ready.delete(token);
+    if (this.hexDraft) {
+      this.clearHexDraftTimer();
+      this.hexDraft = null;
+      this.hexDraftDeadline = 0;
+      this.ready.clear();
+    }
 
     // 房间空了就销毁
     if (this.playerCount === 0) {
@@ -274,6 +519,8 @@ export class Room {
   /** 连接变化或阶段变化时维护“白天掉线 60 秒后临时移交房主”。 */
   onConnectionChanged(): void {
     this.manageHostFailover();
+    // 有人断线/回来 → 硬门槛的「必须等谁」跟着变，重新算一遍
+    this.syncEngineInputs();
     this.broadcast();
   }
 
@@ -354,6 +601,32 @@ export class Room {
     return OK;
   }
 
+  setMode(byToken: string, mode: GameMode): Reply {
+    if (this.playing) return fail(ERR.ROOM_PLAYING, '游戏准备或进行中，不能切换模式');
+    if (byToken !== this.hostToken) return fail(ERR.NOT_HOST, '只有房主可以切换模式');
+    if (mode !== 'STANDARD' && mode !== 'HEX_CHAOS') return fail(ERR.BAD_MESSAGE, '游戏模式不正确');
+    this.mode = mode;
+    if (mode === 'HEX_CHAOS' && (this.board.playerCount < 9 || this.board.playerCount > 12)) {
+      this.board = { ...this.board, playerCount: 12 };
+    }
+    this.ready.clear();
+    this.afterChange();
+    return OK;
+  }
+
+  setRoleWish(token: string, role: Role | null): Reply {
+    if (this.mode === 'HEX_CHAOS') return fail(ERR.BAD_PHASE, '海克斯大乱斗不使用连败愿望');
+    const userId = this.hub.get(token)?.userId;
+    if (!userId) return fail(ERR.BAD_MESSAGE, '登录后才能选择愿望角色');
+    if (role !== null && ((this.board.roles[role] ?? 0) <= 0 || !(role in ROLE_NAME))) {
+      return fail(ERR.INVALID_TARGET, '当前版型里没有这个角色');
+    }
+    const result = this.hub.database.setRoleWish(userId, role);
+    if (!result.ok) return fail(ERR.BAD_PHASE, result.message);
+    this.broadcast();
+    return OK;
+  }
+
   /**
    * 房主修改版型。
    *
@@ -388,7 +661,7 @@ export class Room {
   private sanitizeBoard(input: unknown): BoardConfig {
     const fallback = this.board;
     if (typeof input !== 'object' || input === null) return cloneBoard(fallback);
-    const raw = input as { playerCount?: unknown; roles?: unknown };
+    const raw = input as { playerCount?: unknown; roles?: unknown; puppet?: unknown };
 
     const playerCount = Number(raw.playerCount);
     const rolesInput = (typeof raw.roles === 'object' && raw.roles !== null
@@ -409,19 +682,27 @@ export class Room {
         base.roles[key] = 0;
       }
     }
+    /**
+     * `puppet` 必须原样带过去。
+     *
+     * 这个函数只重建 `playerCount` 和 `roles`，所以任何**版型级开关**都会在这里被抹掉 ——
+     * 「唯邻是从」就踩过这个坑：从预设列表选它，服务端收到的 board 里 puppet 没了，
+     * 于是开局变成一个普通板子，而界面上看起来完全正常（只有玩起来才发现没有傀儡）。
+     * 以后再加版型级字段，记得也在这里放行。
+     */
+    if (raw.puppet === true) base.puppet = true;
     return base;
   }
 
   // ─────────────── 游戏流程 ───────────────
 
   startGame(byToken: string, skipReadyCheck = false): Reply {
-    if (this.game) return fail(ERR.BAD_PHASE, '游戏已经开始了');
+    if (this.game || this.hexDraft) return fail(ERR.BAD_PHASE, '游戏已经开始准备或正在进行');
     if (byToken !== this.hostToken) return fail(ERR.NOT_HOST, '只有房主可以开始游戏');
 
-    // ① 版型必须自洽（角色总数 = 人数）
-    const errors = boardErrors(this.board);
+    const errors = this.currentBoardErrors();
     if (errors.length > 0) {
-      return fail(ERR.INVALID_TARGET, `版型还没配好：${errors[0]!.message}`);
+      return fail(ERR.INVALID_TARGET, `版型还没配好：${errors[0]}`);
     }
 
     // ② 人数必须坐满
@@ -439,6 +720,129 @@ export class Room {
       return fail(ERR.NOT_READY, `还有 ${notReady.length} 人没就绪：${notReady.join('、')} 号`);
     }
 
+    if (this.mode === 'HEX_CHAOS') return this.startHexDraft();
+    const roles = this.weightedStandardDeck();
+    return this.launchGame(roles, cloneBoard(this.board), boardSummary(this.board));
+  }
+
+  private currentBoardErrors(): string[] {
+    if (this.mode === 'HEX_CHAOS') {
+      return this.board.playerCount >= 9 && this.board.playerCount <= 12
+        ? []
+        : ['海克斯大乱斗仅支持 9–12 人'];
+    }
+    return boardErrors(this.board).map((entry) => entry.message);
+  }
+
+  private currentBoardWarnings(): string[] {
+    if (this.mode === 'HEX_CHAOS') return ['至少 3 狼，狼人最多小于总人数一半；身份选择会让阵容强度产生较大波动。'];
+    return boardWarnings(this.board).map((entry) => entry.message);
+  }
+
+  private weightedStandardDeck(): Role[] {
+    const deck = shuffled(boardToDeck(this.board));
+    const locked = new Set<number>();
+    const wishers = shuffled(this.activeSeats().map((token, index) => ({ token: token!, index })));
+    for (const entry of wishers) {
+      const userId = this.hub.get(entry.token)?.userId;
+      if (!userId) continue;
+      const wish = this.hub.database.roleWishState(userId);
+      if (wish.lossStreak < 2 || !wish.role || (this.board.roles[wish.role] ?? 0) <= 0) continue;
+      if (deck[entry.index] === wish.role) {
+        locked.add(entry.index);
+        continue;
+      }
+      // 额外 2/3 的交换机会叠加基础随机概率，接近“三倍权重”但不作中奖承诺。
+      if (Math.random() >= 2 / 3) continue;
+      const holders = deck
+        .map((role, index) => ({ role, index }))
+        .filter((candidate) => candidate.role === wish.role && !locked.has(candidate.index));
+      const holder = holders[Math.floor(Math.random() * holders.length)];
+      if (!holder) continue;
+      [deck[entry.index], deck[holder.index]] = [deck[holder.index]!, deck[entry.index]!];
+      locked.add(entry.index);
+    }
+    return deck;
+  }
+
+  private startHexDraft(): Reply {
+    const tokens = this.activeSeats().filter((token): token is string => token !== null);
+    const randomized = shuffled(tokens);
+    const coreWolfTokens = randomized.slice(0, 3);
+    const coreWolves = new Set(coreWolfTokens);
+    const coreOptions = new Map<string, Role[]>([
+      [coreWolfTokens[0]!, ['WOLF', 'WOLF_KING', 'BLACK_WOLF_KING']],
+      [coreWolfTokens[1]!, ['WOLF', 'MECHANICAL_WOLF', 'MASK']],
+      [coreWolfTokens[2]!, ['WOLF', 'WOLF_KING', 'BLACK_WOLF_KING']],
+    ]);
+    const extraWolfSlots = Math.max(0, Math.floor((tokens.length - 1) / 2) - 3);
+    const optionalWolves = new Set(randomized.slice(3, 3 + extraWolfSlots));
+    const uniqueGood: Role[] = shuffled([
+      'SEER', 'SPIRIT_SEER', 'WITCH', 'GUARD', 'DREAMER', 'DANCER', 'HYBRID',
+    ]);
+    this.hexDraft = new Map();
+    for (const token of tokens) {
+      let options: Role[];
+      if (coreWolves.has(token)) {
+        // 这三人无论怎么选都属于狼营，从结构上保证至少三狼。
+        options = shuffled(coreOptions.get(token)!);
+      } else {
+        const good: Role[] = ['VILLAGER', 'HUNTER', 'IDIOT'];
+        const special = uniqueGood.shift();
+        if (special) good[Math.floor(Math.random() * good.length)] = special;
+        options = optionalWolves.has(token)
+          ? shuffled(['WOLF', ...shuffled(good).slice(0, 2)])
+          : shuffled(good);
+      }
+      this.hexDraft.set(token, { options, selected: null });
+    }
+    this.hexDraftDeadline = Date.now() + HEX_DRAFT_MS;
+    this.clearHexDraftTimer();
+    this.hexDraftTimer = setTimeout(() => this.finishHexDraft(), HEX_DRAFT_MS);
+    this.broadcast();
+    return OK;
+  }
+
+  submitHexChoice(token: string, role: Role): Reply {
+    const entry = this.hexDraft?.get(token);
+    if (!entry) return fail(ERR.BAD_PHASE, '现在不在海克斯选牌阶段');
+    if (!entry.options.includes(role)) return fail(ERR.INVALID_TARGET, '这张身份牌不在你的候选中');
+    entry.selected = role;
+    if ([...this.hexDraft!.values()].every((value) => value.selected !== null)) {
+      return this.finishHexDraft();
+    }
+    this.broadcast();
+    return OK;
+  }
+
+  skipHexDraft(byToken: string): Reply {
+    if (!this.hexDraft) return fail(ERR.BAD_PHASE, '现在不在海克斯选牌阶段');
+    if (byToken !== this.hostToken) return fail(ERR.NOT_HOST, '只有房主可以结束选牌时间');
+    return this.finishHexDraft();
+  }
+
+  private finishHexDraft(): Reply {
+    const draft = this.hexDraft;
+    if (!draft) return fail(ERR.BAD_PHASE, '海克斯选牌已经结束');
+    this.clearHexDraftTimer();
+    const roles = this.activeSeats().map((token) => {
+      const entry = draft.get(token!);
+      if (!entry) return 'VILLAGER' as Role;
+      return entry.selected ?? entry.options[Math.floor(Math.random() * entry.options.length)]!;
+    });
+    this.hexDraft = null;
+    this.hexDraftDeadline = 0;
+    const actualBoard = boardFromDeck(roles);
+    return this.launchGame(roles, actualBoard, `海克斯大乱斗 · ${roles.length} 人 · 身份三选一`);
+  }
+
+  private clearHexDraftTimer(): void {
+    if (this.hexDraftTimer) clearTimeout(this.hexDraftTimer);
+    this.hexDraftTimer = null;
+  }
+
+  private launchGame(roles: Role[], recordedBoard: BoardConfig, summary: string): Reply {
+
     const seeds = this.activeSeats().map((token, i) => {
       const session = this.hub.get(token!);
       return {
@@ -453,9 +857,11 @@ export class Room {
     this.fakeSeerToken = null;
     this.matchNumber = this.hub.database.nextMatchNumber(this.id);
     this.game = new Game(this.id, seeds, {
-      roles: boardToDeck(this.board),
-      shuffle: true,
+      roles,
+      shuffle: false,
       config: this.config,
+      // 「唯邻是从」的首夜傀儡机制跟着**版型**走，不是跟着角色走
+      puppet: this.board.puppet === true,
     });
     const res = this.game.start();
     if (!res.ok) {
@@ -476,9 +882,10 @@ export class Room {
     try {
       this.matchId = this.hub.database.startMatch(
         this.id,
-        this.board,
-        boardSummary(this.board),
+        recordedBoard,
+        summary,
         participants,
+        this.mode,
       );
     } catch (error) {
       console.error('保存场次失败，已取消开局：', error);
@@ -558,7 +965,7 @@ export class Room {
     return res.ok ? OK : fail(res.code ?? ERR.BAD_PHASE, res.message ?? '开枪失败');
   }
 
-  /** 白狼王自爆 */
+  /** 狼人自爆（白狼王带人 / 普通狼空爆） */
   selfDestruct(token: string): Reply {
     if (!this.game) return fail(ERR.BAD_PHASE, '游戏还没有开始');
     const res = this.game.selfDestruct(token);
@@ -574,26 +981,46 @@ export class Room {
     return res.ok ? OK : fail(res.code ?? ERR.BAD_PHASE, res.message ?? '操作失败');
   }
 
-  /** 设置/取消自己的狼队战术标签 */
-  setWolfTag(token: string, tag: WolfTag | null): Reply {
+  /** 骑士翻牌决斗 */
+  knightDuel(token: string, target: number): Reply {
     if (!this.game) return fail(ERR.BAD_PHASE, '游戏还没有开始');
-    const firstNight =
-      this.game.day === 1 &&
-      ['NIGHT_START', 'NIGHT_WOLVES', 'NIGHT_GUARD', 'NIGHT_WITCH', 'NIGHT_SEER'].includes(
-        this.game.phase,
+    const res = this.game.knightDuel(token, target);
+    if (res.ok) this.afterChange();
+    return res.ok ? OK : fail(res.code ?? ERR.BAD_PHASE, res.message ?? '决斗失败');
+  }
+
+  /**
+   * 设置/取消自己的狼队战术标签。
+   *
+   * 房间这一层只管两件**引擎管不着**的事：
+   *  ① 悍跳位被队友占着的时候不许抢 —— 引擎只知道「有人占了」，不知道是谁在操作
+   *  ② 战绩里的 +1 分要认到具体的人，所以记住 fakeSeerToken，并在让位时清掉
+   *
+   * 「悍跳位只能第一夜定、而第一夜之内随便改」这条**时间规则在引擎里**
+   * （见 Game.setWolfTag）—— 那是游戏规则，放在引擎才能被单元测试钉住。
+   * 之前它写在这里，唯一的覆盖是冒烟测试，冒烟一卡就再没人发现它把队友锁死了。
+   */
+  setWolfTag(token: string, tag: WolfTag | null, target: number | null = null): Reply {
+    if (!this.game) return fail(ERR.BAD_PHASE, '游戏还没有开始');
+
+    if (tag === 'FAKE_SEER' && this.fakeSeerToken && this.fakeSeerToken !== token) {
+      const holderSeat = this.activeSeats().indexOf(this.fakeSeerToken) + 1;
+      return fail(
+        ERR.ALREADY_DONE,
+        holderSeat > 0
+          ? `${holderSeat} 号还占着悍跳位。等他再点一下那个按钮取消，或者你自己先选别的。`
+          : '悍跳位已经有人占了，等他取消或者你自己先选别的。',
       );
-    if (tag === 'FAKE_SEER') {
-      if (!firstNight) return fail(ERR.BAD_PHASE, '悍跳位必须在第一夜结束前确定');
-      if (this.fakeSeerToken && this.fakeSeerToken !== token) {
-        return fail(ERR.ALREADY_DONE, '本场悍跳位已经确定，不能转让');
-      }
     }
-    if (this.fakeSeerToken === token && tag !== 'FAKE_SEER') {
-      return fail(ERR.ALREADY_DONE, '悍跳位一旦确定，本场不能取消或改成其他标签');
-    }
-    const res = this.game.setWolfTag(token, tag);
+
+    const res = this.game.setWolfTag(token, tag, target);
     if (res.ok) {
-      if (tag === 'FAKE_SEER') this.fakeSeerToken = token;
+      if (tag === 'FAKE_SEER') {
+        this.fakeSeerToken = token;
+      } else if (this.fakeSeerToken === token) {
+        // 主动让出悍跳位 —— 队友马上就能接手
+        this.fakeSeerToken = null;
+      }
       this.afterChange();
     }
     return res.ok ? OK : fail(res.code ?? ERR.BAD_PHASE, res.message ?? '设置标签失败');
@@ -606,7 +1033,46 @@ export class Room {
     if (byToken !== null && byToken !== this.hostToken) {
       return fail(ERR.NOT_HOST, '只有房主可以跳过当前阶段');
     }
+    // 身份确认阶段不给「跳过」这条路：硬门槛的意义就是不许有人在没看牌的情况下
+    // 被打进夜晚，如果「跳过阶段」能直接天黑，这个门槛等于不存在。
+    if (game.phase === 'ROLE_REVEAL') {
+      const pending = game.pendingRoleRevealSeats();
+      return fail(
+        ERR.BAD_PHASE,
+        pending.length > 0
+          ? `还有 ${pending.length} 人没确认身份（${pending.join('、')} 号），不能用「跳过阶段」开始夜晚`
+          : '请用「天黑请闭眼」开始第一夜',
+      );
+    }
     game.forceAdvance(byToken !== null);
+    this.afterChange();
+    return OK;
+  }
+
+  /** 玩家表示「我已看清我的身份牌」 */
+  confirmRole(byToken: string): Reply {
+    const game = this.game;
+    if (!game) return fail(ERR.BAD_PHASE, '游戏还没有开始');
+    if (!this.has(byToken)) return fail(ERR.NOT_IN_ROOM, '你不在这个房间里');
+    const res = game.confirmRole(byToken);
+    if (!res.ok) return fail(res.code ?? ERR.BAD_PHASE, res.message ?? '确认失败');
+    this.afterChange();
+    return OK;
+  }
+
+  /**
+   * 房主按下「天黑请闭眼」—— 第一夜正式开始。
+   *
+   * 硬门槛本身由引擎判定（它知道谁在线），这里只负责房主权限。
+   * 分成两处是有意的：权限是「谁在操作」，门槛是「规则允不允许」，
+   * 混在一起以后很难查「为什么按钮点了没反应」。
+   */
+  beginNight(byToken: string): Reply {
+    const game = this.game;
+    if (!game) return fail(ERR.BAD_PHASE, '游戏还没有开始');
+    if (byToken !== this.hostToken) return fail(ERR.NOT_HOST, '只有房主可以开始第一夜');
+    const res = game.beginNight();
+    if (!res.ok) return fail(res.code ?? ERR.NOT_READY, res.message ?? '还不能开始第一夜');
     this.afterChange();
     return OK;
   }
@@ -650,7 +1116,12 @@ export class Room {
       if (!this.matchFinished) return fail(ERR.BAD_PHASE, '比赛结果尚未保存，请稍后重试');
     } else {
       try {
-        this.hub.database.abortMatch(this.matchId, this.game.day, this.game.phase);
+        this.hub.database.abortMatch(
+          this.matchId,
+          this.game.day,
+          this.game.phase,
+          this.game.replaySnapshot(),
+        );
       } catch (error) {
         console.error('保存提前结束的场次失败：', error);
         return fail(ERR.BAD_PHASE, '场次保存失败，暂时不能结束');
@@ -735,10 +1206,16 @@ export class Room {
       });
     }
 
-    const errors = boardErrors(this.board);
-    const warnings = boardWarnings(this.board);
+    const errors = this.currentBoardErrors();
+    const warnings = this.currentBoardWarnings();
     const notReady = this.notReadySeats();
     const isHost = token === this.hostToken;
+    const userId = this.hub.get(token)?.userId ?? null;
+    const wish = userId ? this.hub.database.roleWishState(userId) : { lossStreak: 0, role: null };
+    const wishOptions = this.mode === 'STANDARD'
+      ? (Object.keys(this.board.roles) as Role[]).filter((role) => (this.board.roles[role] ?? 0) > 0)
+      : [];
+    const draftEntry = this.hexDraft?.get(token) ?? null;
 
     return {
       roomId: this.id,
@@ -746,20 +1223,40 @@ export class Room {
       matchNumber: this.matchNumber,
       hostTemporary: this.hostTemporary,
       isHallOwner: this.ownerUserId !== null && this.hub.get(token)?.userId === this.ownerUserId,
-      status: this.game ? 'PLAYING' : 'LOBBY',
+      status: this.game || this.hexDraft ? 'PLAYING' : 'LOBBY',
+      mode: this.mode,
       seats,
       playerCount: this.playerCount,
       canStart:
         !this.game &&
+        !this.hexDraft &&
         isHost &&
         errors.length === 0 &&
         this.playerCount === this.seatCapacity &&
         notReady.length === 0,
       config: this.config,
       board: cloneBoard(this.board),
-      boardSummary: boardSummary(this.board),
-      boardErrors: errors.map((e) => e.message),
-      boardWarnings: warnings.map((w) => w.message),
+      boardSummary: this.mode === 'HEX_CHAOS'
+        ? `海克斯大乱斗 · ${this.board.playerCount} 人 · 身份三选一`
+        : boardSummary(this.board),
+      boardErrors: errors,
+      boardWarnings: warnings,
+      roleWish: {
+        lossStreak: wish.lossStreak,
+        eligible: this.mode === 'STANDARD' && wish.lossStreak >= 2,
+        selected: wish.role,
+        options: wishOptions,
+        paused: this.mode === 'HEX_CHAOS',
+      },
+      hexDraft: this.hexDraft && draftEntry
+        ? {
+            options: draftEntry.options.slice(),
+            selected: draftEntry.selected,
+            submitted: [...this.hexDraft.values()].filter((entry) => entry.selected !== null).length,
+            total: this.hexDraft.size,
+            deadline: this.hexDraftDeadline,
+          }
+        : null,
       seatsNeeded: Math.max(0, this.seatCapacity - this.playerCount),
       notReadySeats: notReady,
       shareHint: `把链接发给朋友，或让他们输入房间号 ${this.id}`,
@@ -797,7 +1294,41 @@ export class Room {
     this.tickPacing();
     this.archiveFinishedMatch();
     this.manageHostFailover();
+    // 必须放在 failover 之后：临时接管会改写 hostToken，
+    // 引擎的 hostPlayerId 得跟上，否则临时房主看不到「天黑请闭眼」按钮。
+    this.syncEngineInputs();
     this.broadcast();
+    // 最后落一份快照：服务端随时可能被重启，落库的是「这一刻之后还能继续」的状态
+    this.queuePersist();
+  }
+
+  /**
+   * 把「谁在线」「谁是有效房主」这两个**服务端才知道**的事实同步给引擎。
+   *
+   * 引擎本身不碰网络（这是它可测试的根本），但身份确认的硬门槛需要
+   * 「必须等谁」这个信息 —— 掉线的人点不了按钮，不该把全场锁死。
+   * 所以做成和 holdAdvance 一样的服务端输入。
+   */
+  private syncEngineInputs(): void {
+    const game = this.game;
+    if (!game) return;
+
+    const online = new Set<number>();
+    this.activeSeats().forEach((token, index) => {
+      if (!token) return;
+      if (this.hub.get(token)?.socket != null) online.add(index + 1);
+    });
+    game.onlineSeats = online;
+
+    // token 就是引擎里的 playerId（launchGame 用 token 当 id）；
+    // 房主一定是坐在座位上的 —— setBoard 会拒绝「人数小于最大已占座位」的版型，
+    // 所以房主不会落在 activeSeats() 之外。
+    game.hostPlayerId = this.hostToken;
+  }
+
+  /** 通知引擎「在线情况变了」（连接建立/断开），然后刷新界面 */
+  refreshEngineOnline(): void {
+    this.syncEngineInputs();
   }
 
   private archiveFinishedMatch(): void {
@@ -816,6 +1347,7 @@ export class Room {
         view.day,
         fakeSeerUserId,
         this.game.revealRows().map((row) => ({ seat: row.seat, camp: row.camp })),
+        this.game.replaySnapshot(),
       );
       this.matchFinished = true;
     } catch (error) {
@@ -989,6 +1521,8 @@ export class Room {
     this.clearTimer();
     this.clearPacing();
     this.clearHostFailoverTimer();
+    this.clearHexDraftTimer();
+    this.hexDraft = null;
     this.game = null;
   }
 
@@ -1021,7 +1555,9 @@ export class Room {
       hostName: host?.nickname ?? '房主',
       playerCount: this.playerCount,
       capacity: this.seatCapacity,
-      boardSummary: boardSummary(this.board),
+      boardSummary: this.mode === 'HEX_CHAOS'
+        ? `海克斯大乱斗 · ${this.board.playerCount} 人`
+        : boardSummary(this.board),
       createdAt: this.createdAt,
     };
   }
@@ -1166,11 +1702,50 @@ export class Hub {
         return;
       }
 
+      case 'hall.open': {
+        const roomId = typeof msg.roomId === 'string' ? msg.roomId.trim().toUpperCase() : '';
+        if (!/^[A-Z0-9]{6}$/.test(roomId)) {
+          this.reply(session, fail(ERR.BAD_MESSAGE, '大厅号格式不正确'));
+          return;
+        }
+        const active = this.rooms.get(roomId);
+        if (active) {
+          if (session.roomId !== roomId) this.leaveRoom(session);
+          this.reply(session, active.addPlayer(session.token));
+          return;
+        }
+        const ownerUserId = this.database.hallOwnerUserId(roomId);
+        if (!ownerUserId) {
+          this.reply(session, fail(ERR.ROOM_NOT_FOUND, `没有找到大厅 ${roomId}`));
+          return;
+        }
+        if (ownerUserId !== session.userId) {
+          this.reply(session, fail(ERR.ROOM_NOT_FOUND, '该大厅目前未开启，请等待厅主重新开启'));
+          return;
+        }
+        this.leaveRoom(session);
+        const reopened = new Room(this, roomId, session.token, session.userId);
+        this.rooms.set(roomId, reopened);
+        this.reply(session, reopened.addPlayer(session.token));
+        return;
+      }
+
       case 'room.join': {
         const roomId = typeof msg.roomId === 'string' ? msg.roomId.trim().toUpperCase() : '';
-        const room = this.rooms.get(roomId);
+        let room = this.rooms.get(roomId);
+        if (!room && this.database.hallOwnerUserId(roomId) === session.userId) {
+          room = new Room(this, roomId, session.token, session.userId);
+          this.rooms.set(roomId, room);
+        }
         if (!room) {
-          this.reply(session, fail(ERR.ROOM_NOT_FOUND, `没有找到房间 ${roomId}`));
+          const historical = this.database.hallOwnerUserId(roomId) !== null;
+          this.reply(
+            session,
+            fail(
+              ERR.ROOM_NOT_FOUND,
+              historical ? '该大厅目前未开启，请等待厅主重新开启' : `没有找到大厅 ${roomId}`,
+            ),
+          );
           return;
         }
         if (session.roomId === roomId) {
@@ -1212,6 +1787,39 @@ export class Hub {
         const room = this.currentRoom(session);
         if (!room) return this.reply(session, fail(ERR.NOT_IN_ROOM, '你还没有加入房间'));
         this.reply(session, room.setBoard(session.token, msg.board));
+        return;
+      }
+
+      case 'room.mode': {
+        const room = this.currentRoom(session);
+        if (!room) return this.reply(session, fail(ERR.NOT_IN_ROOM, '你还没有加入房间'));
+        this.reply(session, room.setMode(session.token, msg.mode));
+        return;
+      }
+
+      case 'room.roleWish': {
+        const room = this.currentRoom(session);
+        if (!room) return this.reply(session, fail(ERR.NOT_IN_ROOM, '你还没有加入房间'));
+        const role = msg.role === null ? null : msg.role;
+        if (role !== null && !(role in ROLE_NAME)) {
+          return this.reply(session, fail(ERR.BAD_MESSAGE, '愿望角色不正确'));
+        }
+        this.reply(session, room.setRoleWish(session.token, role));
+        return;
+      }
+
+      case 'room.hexChoose': {
+        const room = this.currentRoom(session);
+        if (!room) return this.reply(session, fail(ERR.NOT_IN_ROOM, '你还没有加入房间'));
+        if (!(msg.role in ROLE_NAME)) return this.reply(session, fail(ERR.BAD_MESSAGE, '身份牌不正确'));
+        this.reply(session, room.submitHexChoice(session.token, msg.role));
+        return;
+      }
+
+      case 'room.hexSkip': {
+        const room = this.currentRoom(session);
+        if (!room) return this.reply(session, fail(ERR.NOT_IN_ROOM, '你还没有加入房间'));
+        this.reply(session, room.skipHexDraft(session.token));
         return;
       }
 
@@ -1319,11 +1927,41 @@ export class Hub {
         return;
       }
 
+      case 'game.knightDuel': {
+        const room = this.currentRoom(session);
+        if (!room) return this.reply(session, fail(ERR.NOT_IN_ROOM, '你还没有加入房间'));
+        const target = Number(msg.target);
+        if (!Number.isInteger(target)) {
+          this.reply(session, fail(ERR.INVALID_TARGET, '决斗目标不正确'));
+          return;
+        }
+        this.reply(session, room.knightDuel(session.token, target));
+        return;
+      }
+
+      case 'game.confirmRole': {
+        const room = this.currentRoom(session);
+        if (!room) return this.reply(session, fail(ERR.NOT_IN_ROOM, '你还没有加入房间'));
+        this.reply(session, room.confirmRole(session.token));
+        return;
+      }
+
+      case 'game.beginNight': {
+        const room = this.currentRoom(session);
+        if (!room) return this.reply(session, fail(ERR.NOT_IN_ROOM, '你还没有加入房间'));
+        this.reply(session, room.beginNight(session.token));
+        return;
+      }
+
       case 'game.wolfTag': {
         const room = this.currentRoom(session);
         if (!room) return this.reply(session, fail(ERR.NOT_IN_ROOM, '你还没有加入房间'));
         const tag = msg.tag === null ? null : (msg.tag as WolfTag);
-        this.reply(session, room.setWolfTag(session.token, tag));
+        const target = msg.target === undefined || msg.target === null ? null : Number(msg.target);
+        if (target !== null && !Number.isInteger(target)) {
+          return this.reply(session, fail(ERR.INVALID_TARGET, '狼踩狼的目标座位不正确'));
+        }
+        this.reply(session, room.setWolfTag(session.token, tag, target));
         return;
       }
 
@@ -1413,10 +2051,76 @@ export class Hub {
     for (const session of this.sessions.values()) {
       if (session.roomId === id) session.roomId = null;
     }
+    // 房间已不存在，快照留着只会让下次启动复活一个空壳
+    try {
+      this.database.deleteRoomSnapshot(id);
+    } catch (error) {
+      console.error(`删除房间 ${id} 的快照失败：`, error);
+    }
+  }
+
+  getRoom(id: string): Room | undefined {
+    return this.rooms.get(id);
+  }
+
+  /**
+   * 同步落盘所有房间的快照（优雅退出时用）。
+   *
+   * 平时落库走 setImmediate（合并连发变更、不拖慢消息处理），但进程退出前
+   * 事件循环可能不再跑 check 阶段 —— 这里同步补一次，把最后几步变更也存住。
+   */
+  flushSnapshots(): void {
+    for (const room of this.rooms.values()) {
+      try {
+        this.database.saveRoomSnapshot(room.id, JSON.stringify(room.snapshot()));
+      } catch (error) {
+        console.error(`退出前保存房间 ${room.id} 的快照失败：`, error);
+      }
+    }
+  }
+
+  /**
+   * 启动时从数据库恢复未结束的房间（「进行中房间持久化」的入口）。
+   *
+   * 恢复失败的快照直接删掉：留着不仅没用，还会每次启动都报一次同样的错。
+   * 返回成功恢复的房间数，供启动日志打印。
+   */
+  restorePersistedRooms(): number {
+    let restored = 0;
+    let rows: ReturnType<GameDatabase['loadRoomSnapshots']> = [];
+    try {
+      rows = this.database.loadRoomSnapshots();
+    } catch (error) {
+      console.error('读取房间快照失败，跳过恢复：', error);
+      return 0;
+    }
+    for (const row of rows) {
+      let room: Room | null = null;
+      try {
+        room = Room.restore(this, row.roomId, row.payload);
+      } catch (error) {
+        console.error(`恢复房间 ${row.roomId} 的快照失败，已丢弃：`, error);
+      }
+      if (!room) {
+        try {
+          this.database.deleteRoomSnapshot(row.roomId);
+        } catch {
+          /* 删失败也不阻塞其余房间恢复 */
+        }
+        continue;
+      }
+      this.rooms.set(room.id, room);
+      restored += 1;
+    }
+    return restored;
   }
 
   refreshHall(id: string): void {
     this.rooms.get(id)?.refreshHallData();
+  }
+
+  isHallActive(id: string): boolean {
+    return this.rooms.has(id);
   }
 
   /** 清理长时间失联的会话与空房间 */
@@ -1425,13 +2129,16 @@ export class Hub {
     for (const [token, session] of this.sessions) {
       if (session.socket) continue;
       if (now - session.lastSeen < maxIdleMs) continue;
+      // 对局中的座位不清理：等本人重连，游戏由定时器继续推进。
+      // （清掉座位并不会把人从引擎里移除，只会让他永远连不回来 —— 对谁都没好处。）
+      const room = session.roomId ? this.rooms.get(session.roomId) : undefined;
+      if (room?.playing) continue;
       this.leaveRoom(session);
       this.sessions.delete(token);
     }
     for (const [id, room] of this.rooms) {
       if (room.playerCount === 0 && !room.playing) {
-        room.dispose();
-        this.rooms.delete(id);
+        this.destroyRoom(id); // 顺带删掉快照，否则下次启动会复活一个空房间
       }
     }
   }

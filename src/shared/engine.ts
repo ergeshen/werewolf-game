@@ -11,10 +11,12 @@
  * 已实现的角色与规则：
  * - 狼人 / 白狼王：夜里共同点刀，多数票生效。
  * - 白狼王：白天可以自爆并带走一名玩家，自爆后直接进入黑夜（当天不再投票）。
+ * - 普通狼人：白天可以空爆（不带人），警长竞选期间自爆会终止竞选并使警徽流失。
  * - 守卫：每晚守护一人免疫狼刀；不能连续两晚守同一人；**同守同救时该玩家依然死亡**。
  * - 女巫：解药 / 毒药各 1 瓶，全局一次；同一夜不能双药；默认不可自救。
  * - 预言家：每晚查验一人阵营。
- * - 猎人：被狼刀死 或 被投票放逐 可开枪；被毒死、被白狼王带走不能开枪。
+ * - 猎人：被狼刀、放逐或狼王开枪带走时可开枪；被毒、摄梦或白狼王带走不能开枪。
+ * - 摄梦人：每夜梦一名其他玩家；梦游者免疫夜间伤害，连梦两夜或摄梦人夜死会被带走。
  * - 白痴：被投票放逐时翻牌免死，永久失去投票权。
  * - 平民：无技能。
  *
@@ -31,15 +33,22 @@ import {
   type Camp,
   type Role,
 } from './roles.ts';
+import { canBeKnifed, nightOrderFor } from './roles.ts';
+import { SENTENCE_GAP_MS, seatsCues, type VoiceCue } from './voice-clips.ts';
 import {
   DEFAULT_ROOM_CONFIG,
   DEATH_CAUSE_LABEL,
   PHASE_LABEL,
+  WOLF_TAG_LABEL,
+  NIGHT_PHASE_BY_ROLE,
   isExclusiveWolfTag,
+  isPairedWolfTag,
   type DeathCause,
   type DeathView,
   type GameView,
   type NightAction,
+  type MatchReplay,
+  type MatchReplayNight,
   type Phase,
   type SheriffDirection,
   type RevealRow,
@@ -56,16 +65,45 @@ import {
 
 // ────────────────────────────── 工具 ──────────────────────────────
 
-/** 可复现的伪随机数生成器（用于测试固定牌序） */
-export function mulberry32(seed: number): () => number {
-  let a = seed >>> 0;
-  return () => {
-    a = (a + 0x6d2b79f5) >>> 0;
-    let t = a;
+/**
+ * 带状态外露的 mulberry32。
+ *
+ * 引擎的随机流必须可以**存档续传**：服务端重启恢复对局后，随机数序列
+ * 要从断点继续，否则同一局里重启前后的随机行为会不可复现。
+ * 闭包版的 mulberry32 拿不到内部状态，所以换成这个类。
+ */
+export class SeededRng {
+  private a: number;
+
+  constructor(seed: number) {
+    this.a = seed >>> 0;
+  }
+
+  /** 从快照保存的内部状态续流 */
+  static resume(state: number): SeededRng {
+    const rng = new SeededRng(0);
+    rng.a = state >>> 0;
+    return rng;
+  }
+
+  /** 内部状态：存进快照，恢复后随机流从断点继续 */
+  get state(): number {
+    return this.a;
+  }
+
+  next(): number {
+    this.a = (this.a + 0x6d2b79f5) >>> 0;
+    let t = this.a;
     t = Math.imul(t ^ (t >>> 15), t | 1);
     t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
+  }
+}
+
+/** 可复现的伪随机数生成器（用于测试固定牌序） */
+export function mulberry32(seed: number): () => number {
+  const rng = new SeededRng(seed);
+  return () => rng.next();
 }
 
 function shuffle<T>(input: readonly T[], rng: () => number): T[] {
@@ -100,29 +138,41 @@ function fail(code: string, message: string): ActResult {
  */
 export const PHASE_TIMEOUT_MS: Record<Phase, number> = {
   WAITING: Number.POSITIVE_INFINITY,
+  // 身份确认**故意没有任何计时器**。这是全场唯一一个完全由真人节奏决定的阶段：
+  // 有人要读长描述、狼要找队友、女巫要弄明白两瓶药。
+  // 一旦给它倒计时，「为什么这次天黑得特别慢」就变成了可被观察、可被反推的信息。
+  ROLE_REVEAL: Number.POSITIVE_INFINITY,
   NIGHT_START: 5_000,
   NIGHT_HYBRID: 30_000,
   NIGHT_MECHANICAL: 40_000,
   NIGHT_DANCER: 60_000,
   NIGHT_MASK: 60_000,
+  NIGHT_DREAMER: 45_000,
   NIGHT_WOLVES: 90_000, // 1 分半战术安排
+  // 狼美人是「狼队刀完之后独自睁眼」，不需要再留战术时间：
+  // 她只有一个人、只有一个选择，30 秒足够。
+  NIGHT_BEAUTY_CHARM: 30_000,
   NIGHT_GUARD: 30_000,
   NIGHT_WITCH: 40_000,
   NIGHT_SEER: 30_000,
   NIGHT_SPIRIT_SEER: 30_000,
+  // 守墓人只有一个「我已知晓」要按，而且结果在阶段开始时就已经给他了
+  NIGHT_GRAVE_KEEPER: 20_000,
   NIGHT_RESOLVE: 2_500,
-  DAY_ANNOUNCE: 18_000,
-  SHERIFF_SIGNUP: 30_000,
-  SHERIFF_CAMPAIGN: 180_000,
-  SHERIFF_VOTE: 45_000,
-  SHERIFF_PK: 120_000,
-  SHERIFF_REVOTE: 45_000,
-  DAY_SPEECH: 180_000,
-  DAY_VOTE: 60_000,
-  DAY_EXILE: 7_000,
-  SHERIFF_TRANSFER: 30_000,
-  HUNTER_SHOOT: 25_000,
-  WOLF_KING_BOOM: 20_000,
+  // 面杀的白天由真人发言和操作，不能让服务器倒计时擅自推进。
+  // 有玩家操作的阶段仍会在所有人提交后正常结算；其余阶段由房主手动跳过。
+  DAY_ANNOUNCE: Number.POSITIVE_INFINITY,
+  SHERIFF_SIGNUP: Number.POSITIVE_INFINITY,
+  SHERIFF_CAMPAIGN: Number.POSITIVE_INFINITY,
+  SHERIFF_VOTE: Number.POSITIVE_INFINITY,
+  SHERIFF_PK: Number.POSITIVE_INFINITY,
+  SHERIFF_REVOTE: Number.POSITIVE_INFINITY,
+  DAY_SPEECH: Number.POSITIVE_INFINITY,
+  DAY_VOTE: Number.POSITIVE_INFINITY,
+  DAY_EXILE: Number.POSITIVE_INFINITY,
+  SHERIFF_TRANSFER: Number.POSITIVE_INFINITY,
+  HUNTER_SHOOT: Number.POSITIVE_INFINITY,
+  WOLF_KING_BOOM: Number.POSITIVE_INFINITY,
   GAME_OVER: Number.POSITIVE_INFINITY,
 };
 
@@ -132,6 +182,7 @@ export const MAX_DAYS = 20;
 /** 这些阶段只由定时器 / 房主手动推进，给玩家留出阅读时间 */
 const PAUSE_PHASES: ReadonlySet<Phase> = new Set<Phase>([
   'WAITING',
+  'ROLE_REVEAL',
   'NIGHT_START',
   'NIGHT_RESOLVE',
   'DAY_ANNOUNCE',
@@ -154,11 +205,15 @@ const NIGHT_OPEN_LINE: Partial<Record<Phase, string>> = {
   NIGHT_MECHANICAL: '机械狼请睁眼，请选择要学习身份的玩家。',
   NIGHT_DANCER: '舞者请睁眼，请选择三名玩家进入舞池。',
   NIGHT_MASK: '假面请睁眼，请先查验舞池，再选择一名玩家戴上面具。',
+  NIGHT_DREAMER: '摄梦人请睁眼，请选择今晚的梦游者。',
   NIGHT_WOLVES: '狼人请睁眼，请确认今晚的战术，选择要击杀的玩家。',
+  NIGHT_BEAUTY_CHARM: '狼美人请睁眼，请选择今晚要魅惑的玩家。',
   NIGHT_GUARD: '守卫请睁眼，请选择今晚要守护的玩家。',
   NIGHT_WITCH: '女巫请睁眼。',
   NIGHT_SEER: '预言家请睁眼，请选择今晚要查验的玩家。',
   NIGHT_SPIRIT_SEER: '通灵师请睁眼，请选择今晚要查验具体身份的玩家。',
+  // 注意：守墓人台词绝不能带出查验结果 —— 全场听到的一模一样
+  NIGHT_GRAVE_KEEPER: '守墓人请睁眼。',
 };
 
 /** 对应的「闭眼」台词，会拼在下一个阶段的开头 */
@@ -167,11 +222,52 @@ const NIGHT_CLOSE_LINE: Partial<Record<Phase, string>> = {
   NIGHT_MECHANICAL: '机械狼请闭眼。',
   NIGHT_DANCER: '舞者请闭眼。',
   NIGHT_MASK: '假面请闭眼。',
+  NIGHT_DREAMER: '摄梦人请闭眼。',
   NIGHT_WOLVES: '狼人请闭眼。',
+  NIGHT_BEAUTY_CHARM: '狼美人请闭眼。',
   NIGHT_GUARD: '守卫请闭眼。',
   NIGHT_WITCH: '女巫请闭眼。',
   NIGHT_SEER: '预言家请闭眼。',
   NIGHT_SPIRIT_SEER: '通灵师请闭眼。',
+  NIGHT_GRAVE_KEEPER: '守墓人请闭眼。',
+};
+
+/**
+ * 同一段台词在**录音语音包**里对应的片段 id。
+ *
+ * 为什么要两张表：文字版（上面那两张）给浏览器 TTS 兜底，
+ * 片段 id 给录音包用。录音可以把「闭眼」和「睁眼」分成两段、中间留停顿，
+ * 听起来像一个真法官；而 TTS 只能把整句一口气念完。
+ * 两者的**用词必须一致** —— engine.test.ts 里有一条测试逐阶段比对。
+ */
+const OPEN_CLIP: Partial<Record<Phase, string>> = {
+  NIGHT_HYBRID: 'open.hybrid',
+  NIGHT_MECHANICAL: 'open.mechanical',
+  NIGHT_DANCER: 'open.dancer',
+  NIGHT_MASK: 'open.mask',
+  NIGHT_DREAMER: 'open.dreamer',
+  NIGHT_WOLVES: 'open.wolves',
+  NIGHT_BEAUTY_CHARM: 'open.beauty',
+  NIGHT_GUARD: 'open.guard',
+  NIGHT_WITCH: 'open.witch',
+  NIGHT_SEER: 'open.seer',
+  NIGHT_SPIRIT_SEER: 'open.spirit',
+  NIGHT_GRAVE_KEEPER: 'open.gravekeeper',
+};
+
+const CLOSE_CLIP: Partial<Record<Phase, string>> = {
+  NIGHT_HYBRID: 'close.hybrid',
+  NIGHT_MECHANICAL: 'close.mechanical',
+  NIGHT_DANCER: 'close.dancer',
+  NIGHT_MASK: 'close.mask',
+  NIGHT_DREAMER: 'close.dreamer',
+  NIGHT_WOLVES: 'close.wolves',
+  NIGHT_BEAUTY_CHARM: 'close.beauty',
+  NIGHT_GUARD: 'close.guard',
+  NIGHT_WITCH: 'close.witch',
+  NIGHT_SEER: 'close.seer',
+  NIGHT_SPIRIT_SEER: 'close.spirit',
+  NIGHT_GRAVE_KEEPER: 'close.gravekeeper',
 };
 
 // ────────────────────────────── 状态 ──────────────────────────────
@@ -214,10 +310,31 @@ interface NightState {
   maskInspectActed: boolean;
   maskTarget: number | null;
   maskActed: boolean;
+  dreamerTarget: number | null;
+  dreamerActed: boolean;
+  /** 狼美人本夜魅惑了谁 */
+  beautyCharmTarget: number | null;
+  beautyCharmActed: boolean;
+  /**
+   * 恶灵骑士本夜反伤了谁。
+   *
+   * 记录「谁」而不是「有没有反伤」是关键：同一夜可能既有人毒他、又有人验他，
+   * 而按官方规则**只有先行动的那个人**吃反伤。夜间行动顺序 = 阶段顺序
+   * （女巫在预言家之前），所以「谁先提交」天然就是「谁先行动」——
+   * 这里只认第一个写进来的。
+   */
+  darkLordReflectVictim: number | null;
   /** 狼人各自的选择：座位 → 目标座位（null = 空刀） */
   wolfPicks: Map<number, number | null>;
   /** 多数决出的刀口 */
   wolfTarget: number | null;
+  /**
+   * 首夜狼队各自选的**傀儡**：座位 → 目标座位。
+   * 只在「唯邻是从」板子的第一夜有值，之后永远是空的。
+   */
+  puppetPicks: Map<number, number>;
+  /** 多数决出的傀儡（首夜定下）。真正生效的是 engine 上的 `puppetSeat`。 */
+  puppetTarget: number | null;
   /** 守卫守护的座位 */
   guardTarget: number | null;
   guardActed: boolean;
@@ -240,6 +357,9 @@ interface NightState {
   mechanicalSpiritTarget: number | null;
   mechanicalSpiritRole: Role | null;
   mechanicalSpiritActed: boolean;
+  /** 守墓人本夜的查验结果；null 表示本夜没有守墓人环节（首夜）或无人需要查验 */
+  graveCheck: { seat: number | null; isWolf: boolean } | null;
+  graveKeeperActed: boolean;
 }
 
 export interface GameOptions {
@@ -249,6 +369,127 @@ export interface GameOptions {
   shuffle?: boolean;
   config?: Partial<RoomConfig>;
   seed?: number;
+  /**
+   * 「唯邻是从」：首夜狼队要选一名傀儡。
+   *
+   * 必须由**版型**传进来，不能只看「首夜有没有狼」——
+   * 否则每一个版型都会变成唯邻是从。
+   */
+  puppet?: boolean;
+}
+
+/**
+ * 快照格式版本。**任何会让旧快照语义变化的改动都必须 bump**：
+ * 加字段可以不 bump（restore 对缺省字段有兜底），但改语义 / 删字段 / 改结构必须。
+ * 版本不符的快照会被直接丢弃 —— 宁可丢一局，不能加载出规则错乱的局。
+ */
+export const GAME_SNAPSHOT_VERSION = 1;
+
+/** 全部合法阶段名。快照恢复时用它拦截损坏数据。 */
+const PHASE_NAMES: ReadonlySet<string> = new Set([
+  'WAITING', 'ROLE_REVEAL',
+  'NIGHT_START', 'NIGHT_HYBRID', 'NIGHT_MECHANICAL', 'NIGHT_DANCER', 'NIGHT_MASK',
+  'NIGHT_DREAMER', 'NIGHT_WOLVES', 'NIGHT_BEAUTY_CHARM', 'NIGHT_GUARD', 'NIGHT_WITCH',
+  'NIGHT_SEER', 'NIGHT_SPIRIT_SEER', 'NIGHT_GRAVE_KEEPER', 'NIGHT_RESOLVE',
+  'DAY_ANNOUNCE', 'SHERIFF_SIGNUP', 'SHERIFF_CAMPAIGN', 'SHERIFF_VOTE', 'SHERIFF_PK',
+  'SHERIFF_REVOTE', 'DAY_SPEECH', 'DAY_VOTE', 'DAY_EXILE', 'SHERIFF_TRANSFER',
+  'HUNTER_SHOOT', 'WOLF_KING_BOOM', 'GAME_OVER',
+] satisfies Phase[] as string[]);
+
+/**
+ * 一局游戏的完整存档（纯 JSON 数据）。
+ *
+ * Map / Set 一律存 entries 数组；`sheriffTransferChoice` / `hunterChoice` / `boomChoice`
+ * 是三态（undefined / null / 数字），JSON 会丢掉 undefined 的键，恢复时读不到即为
+ * undefined，语义正好保住。
+ */
+export interface GameSnapshot {
+  v: number;
+  roomId: string;
+  config: RoomConfig;
+  phase: Phase;
+  day: number;
+  deadline: number | null;
+  countdown: number | null;
+  countdownEndsAt: number | null;
+  holdAdvance: boolean;
+  hostPlayerId: string | null;
+  roleRevealConfirmed: string[];
+  lastCharmedSeat: number | null;
+  darkLordReflectUsed: boolean;
+  players: Array<{
+    id: string;
+    seat: number;
+    nickname: string;
+    avatar: string;
+    isHost: boolean;
+    role: Role;
+    alive: boolean;
+    idiotRevealed: boolean;
+  }>;
+  night: Omit<NightState, 'wolfPicks' | 'puppetPicks'> & {
+    wolfPicks: [number, number | null][];
+    puppetPicks: [number, number][];
+  };
+  witchPotions: { antidote: boolean; poison: boolean };
+  seerHistory: [number, { seat: number; camp: Camp }[]][];
+  spiritHistory: [number, { seat: number; role: Role }[]][];
+  hybridModelSeat: number | null;
+  mechanicalLearnedRole: Role | null;
+  mechanicalLearnedDay: number | null;
+  mechanicalPoisonAvailable: boolean;
+  mechanicalLastGuardedSeat: number | null;
+  danceUsedSeats: number[];
+  danceHistory: { day: number; seats: number[] }[];
+  maskHistory: { day: number; inspectSeat: number; inDance: boolean; maskSeat: number | null }[];
+  lastMaskInspectSeat: number | null;
+  lastMaskTargetSeat: number | null;
+  lastDreamedSeat: number | null;
+  dreamHistory: { day: number; seat: number }[];
+  lastDayExiledSeat: number | null;
+  graveHistory: { day: number; seat: number | null; isWolf: boolean }[];
+  knightUsed: boolean;
+  votes: [number, number | null][];
+  sheriffSeat: number | null;
+  sheriffElectionFinished: boolean;
+  sheriffSignup: [number, boolean][];
+  sheriffCandidates: number[];
+  sheriffWithdrawn: number[];
+  sheriffVotes: [number, number | null][];
+  sheriffTieCandidates: number[];
+  sheriffSpeechOrder: number[];
+  sheriffElectionRound: number;
+  sheriffTransferChoice: number | null | undefined;
+  sheriffTransferFrom: number | null;
+  sheriffTransferReturn: 'ANNOUNCE' | 'EXILE' | 'HUNTER' | 'BOOM' | 'SPEECH';
+  speechDirection: SheriffDirection | null;
+  deaths: DeathRecord[];
+  lastNightDeaths: number[];
+  exiled: { seat: number; nickname: string } | null;
+  voteDetail: VoteRecordView[];
+  hunterPendingSeat: number | null;
+  hunterQueue: number[];
+  hunterChoice: number | null | undefined;
+  hunterReturnPhase: Phase;
+  boomPendingSeat: number | null;
+  boomChoice: number | null | undefined;
+  lastGuardedSeat: number | null;
+  puppetSeat: number | null;
+  wolfTags: [number, WolfTag][];
+  wolfTagTargets: [number, number][];
+  winner: Camp | null;
+  draw: boolean;
+  log: string[];
+  secretLog: string[];
+  /** 本阶段要全场播报的自爆/空爆座位（公开信息，见 boomAnnouncements） */
+  boomAnnouncements: number[];
+  replayNights: MatchReplayNight[];
+  replayDayVotes: Array<{ day: number; votes: VoteRecordView[] }>;
+  revealAllRequested: string[];
+  speechStartSeat: number | null;
+  rngState: number;
+  boardRoles: Role[];
+  puppetEnabled: boolean;
 }
 
 export class Game {
@@ -277,6 +518,46 @@ export class Game {
    */
   holdAdvance = false;
 
+  /**
+   * 由服务端设置：当前**在线**的座位号。
+   *
+   * 引擎本身不碰网络，但「身份确认的硬门槛」需要知道谁在线才能决定
+   * 「必须等谁」。所以把它做成和 holdAdvance 一样的服务端输入：
+   * 服务端在连接变化时更新它，引擎只读。
+   *
+   * 唯一的用途是 `canBeginNight()` —— 掉线的人点不了确认按钮，
+   * 不该把全场锁死。集合为空时退化成最严格（要求全员确认）。
+   */
+  onlineSeats = new Set<number>();
+
+  /**
+   * 由服务端设置：当前**有效房主**的玩家 id。
+   *
+   * 为什么不能直接读 PlayerState.isHost：那是发牌那一刻定死的
+   * （`isHost: token === this.hostToken`）。房主掉线后服务端会把操作权临时
+   * 移交给别人，而引擎里的 isHost 标记不会跟着变 —— 结果就是临时房主
+   * 在自己界面上看不到「天黑请闭眼」按钮，全场继续锁死。
+   * 所以把它也做成服务端输入的字段，由服务端在移交/收回时同步。
+   */
+  hostPlayerId: string | null = null;
+
+  /** 身份确认阶段已经点过「我已看清我的身份牌」的玩家 id */
+  private roleRevealConfirmed = new Set<string>();
+
+  /**
+   * 狼美人**上一夜**魅惑的座位。
+   * 她出局时殉情的就是这个人 —— 必须是「上一夜」而不是「本夜」：
+   * 本夜刚魅惑完就死，那个人不该陪葬。
+   */
+  private lastCharmedSeat: number | null = null;
+
+  /**
+   * 恶灵骑士的反伤是不是已经用过了。
+   * 官方的「一次性反伤」：整局只反一次，用掉之后他依然夜里杀不死，
+   * 但剩下的毒药和查验都可以放心用了。
+   */
+  private darkLordReflectUsed = false;
+
   private players: PlayerState[] = [];
   private night: NightState = emptyNight();
   private witchPotions = { antidote: true, poison: true };
@@ -293,6 +574,19 @@ export class Game {
   private maskHistory: { day: number; inspectSeat: number; inDance: boolean; maskSeat: number | null }[] = [];
   private lastMaskInspectSeat: number | null = null;
   private lastMaskTargetSeat: number | null = null;
+  private lastDreamedSeat: number | null = null;
+  private dreamHistory: { day: number; seat: number }[] = [];
+  /**
+   * 上一白天被投票放逐的座位（无人被放逐则为 null）。
+   *
+   * 在进入下一夜的 NIGHT_START 时从 `exiled` 抄一份过来 —— 那之后
+   * `exiled` 会被清空，而守墓人在本夜里要查的正是「昨天放逐了谁」。
+   */
+  private lastDayExiledSeat: number | null = null;
+  /** 守墓人本人可见的逐夜查验记录；seat 为 null 表示那天无人被放逐。 */
+  private graveHistory: { day: number; seat: number | null; isWolf: boolean }[] = [];
+  /** 骑士的决斗是否已经用过（无论决斗输赢都算用过） */
+  private knightUsed = false;
   private votes = new Map<number, number | null>();
   private sheriffSeat: number | null = null;
   private sheriffElectionFinished = false;
@@ -305,7 +599,7 @@ export class Game {
   private sheriffElectionRound: 0 | 1 | 2 = 0;
   private sheriffTransferChoice: number | null | undefined = undefined;
   private sheriffTransferFrom: number | null = null;
-  private sheriffTransferReturn: 'ANNOUNCE' | 'EXILE' | 'HUNTER' | 'BOOM' = 'ANNOUNCE';
+  private sheriffTransferReturn: 'ANNOUNCE' | 'EXILE' | 'HUNTER' | 'BOOM' | 'SPEECH' = 'ANNOUNCE';
   private speechDirection: SheriffDirection | null = null;
   private deaths: DeathRecord[] = [];
   private lastNightDeaths: number[] = [];
@@ -320,18 +614,41 @@ export class Game {
   private boomChoice: number | null | undefined = undefined;
   /** 守卫上一夜守了谁（不能连续两晚守同一人） */
   private lastGuardedSeat: number | null = null;
+  /**
+   * 「唯邻是从」的灵魂：**傀儡**的座位。
+   *
+   * 他保留原底牌、照常按原身份操作、**不知道自己已经变成狼人阵营** ——
+   * 但他的技能全部失效或反转，而且真预言家验他会显示【狼人】。
+   *
+   * 这是玩家级状态而不是角色：傀儡没有新底牌，只是阵营被暗中改了。
+   * 别处一律通过 `truthCamp()` 读取，不要直接看这个字段。
+   */
+  private puppetSeat: number | null = null;
   /** 狼队战术标签：座位 → 标签。只有狼人之间能看到。 */
   private wolfTags = new Map<number, WolfTag>();
+  /** 狼踩狼：座位 → 这个座位填的「踩谁」。只有互指配对成功才算数。 */
+  private wolfTagTargets = new Map<number, number>();
   private winner: Camp | null = null;
   /** 流局标记：达到 MAX_DAYS 仍无胜者 */
   private draw = false;
   /** 公开事件流：所有玩家都能看到，只包含公开信息 */
   private log: string[] = [];
+  /**
+   * 本阶段需要全场播报的自爆/空爆座位（公开信息）。
+   *
+   * 自爆发生在白天，播报却挂在紧随其后的 NIGHT_START 语音里 ——
+   * 天黑语音是全场同时念的，把「X 号自爆了」拼进去，所有人同一时刻听到同一句。
+   * 每个 NIGHT_START 入场时清空（读走即消费）。
+   */
+  private boomAnnouncements: number[] = [];
   /** 私有事件流：仅服务端可见，用于运营排查，绝不下发给客户端 */
   private secretLog: string[] = [];
+  /** 已完成夜晚的结构化回顾；只在整场结束后由服务端持久化。 */
+  private replayNights: MatchReplayNight[] = [];
+  private replayDayVotes: Array<{ day: number; votes: VoteRecordView[] }> = [];
   private revealAllRequested = new Set<string>();
   private speechStartSeat: number | null = null;
-  private readonly rng: () => number;
+  private rng: SeededRng;
   /** 开局时各阵营类别的数量，用于「屠边」判定（不存在的类别不参与判定） */
   private readonly initialGods: number;
   private readonly initialVillagers: number;
@@ -342,15 +659,18 @@ export class Game {
    * 绝不看「那个角色死没死」—— 否则阶段时长就成了情报。
    */
   private readonly boardRoles: readonly Role[];
+  /** 本局是不是「唯邻是从」（首夜狼队要选傀儡） */
+  private readonly puppetEnabled: boolean;
 
   constructor(roomId: string, seeds: PlayerSeed[], options: GameOptions) {
     this.roomId = roomId;
     this.config = { ...DEFAULT_ROOM_CONFIG, ...(options.config ?? {}) };
-    this.rng = mulberry32(options.seed ?? Math.floor(Math.random() * 2 ** 31));
+    this.rng = new SeededRng(options.seed ?? Math.floor(Math.random() * 2 ** 31));
     this.deckSize = options.roles.length;
     this.boardRoles = options.roles.slice();
+    this.puppetEnabled = options.puppet === true;
 
-    const deck = options.shuffle ? shuffle(options.roles, this.rng) : options.roles.slice();
+    const deck = options.shuffle ? shuffle(options.roles, () => this.rng.next()) : options.roles.slice();
 
     this.players = seeds
       .slice()
@@ -369,6 +689,221 @@ export class Game {
 
     this.initialGods = this.players.filter((p) => isGod(p.role)).length;
     this.initialVillagers = this.players.filter((p) => p.role === 'VILLAGER' || p.role === 'HYBRID').length;
+    // 默认房主 = 发牌时的房主；服务端之后可以因为临时接管而改写它
+    this.hostPlayerId = this.players.find((p) => p.isHost)?.id ?? this.players[0]?.id ?? null;
+  }
+
+  // ─────────────────── 快照与恢复（进行中对局持久化） ───────────────────
+
+  /** 仅供单元测试：不经过技能链直接让一名玩家出局（毒杀死因，压住猎人/狼王开枪）。 */
+  killForTest(seat: number): void {
+    const p = this.bySeat(seat);
+    if (p) this.kill(p, 'POISON');
+  }
+
+  /**
+   * 把整局游戏状态导出成**纯 JSON 数据**（服务端重启后据此恢复）。
+   *
+   * 纪律：
+   * - 快照是上帝视角（含所有隐藏身份），只允许落库，绝不能发给任何客户端。
+   * - `onlineSeats` 不进快照 —— 它是「此刻谁连着」的瞬时事实，恢复后由服务端重算
+   *   （没人连着时为空集，引擎会退化成最严格判定，正是恢复瞬间该有的语义）。
+   * - 每加一个 Game 的字段，这里和 `restore()` 必须**同步**补上；
+   *   `engine.test.ts` 的「快照回环」用例会在漏字段时失败（恢复后再快照对不上）。
+   */
+  snapshot(): GameSnapshot {
+    return {
+      v: GAME_SNAPSHOT_VERSION,
+      roomId: this.roomId,
+      config: { ...this.config },
+      phase: this.phase,
+      day: this.day,
+      deadline: this.deadline,
+      countdown: this.countdown,
+      countdownEndsAt: this.countdownEndsAt,
+      holdAdvance: this.holdAdvance,
+      hostPlayerId: this.hostPlayerId,
+      roleRevealConfirmed: [...this.roleRevealConfirmed],
+      lastCharmedSeat: this.lastCharmedSeat,
+      darkLordReflectUsed: this.darkLordReflectUsed,
+      players: this.players.map((p) => ({ ...p })),
+      night: {
+        ...this.night,
+        wolfPicks: [...this.night.wolfPicks.entries()],
+        puppetPicks: [...this.night.puppetPicks.entries()],
+      },
+      witchPotions: { ...this.witchPotions },
+      seerHistory: [...this.seerHistory.entries()],
+      spiritHistory: [...this.spiritHistory.entries()],
+      hybridModelSeat: this.hybridModelSeat,
+      mechanicalLearnedRole: this.mechanicalLearnedRole,
+      mechanicalLearnedDay: this.mechanicalLearnedDay,
+      mechanicalPoisonAvailable: this.mechanicalPoisonAvailable,
+      mechanicalLastGuardedSeat: this.mechanicalLastGuardedSeat,
+      danceUsedSeats: [...this.danceUsedSeats],
+      danceHistory: this.danceHistory.map((e) => ({ ...e })),
+      maskHistory: this.maskHistory.map((e) => ({ ...e })),
+      lastMaskInspectSeat: this.lastMaskInspectSeat,
+      lastMaskTargetSeat: this.lastMaskTargetSeat,
+      lastDreamedSeat: this.lastDreamedSeat,
+      dreamHistory: this.dreamHistory.map((e) => ({ ...e })),
+      lastDayExiledSeat: this.lastDayExiledSeat,
+      graveHistory: this.graveHistory.map((e) => ({ ...e })),
+      knightUsed: this.knightUsed,
+      votes: [...this.votes.entries()],
+      sheriffSeat: this.sheriffSeat,
+      sheriffElectionFinished: this.sheriffElectionFinished,
+      sheriffSignup: [...this.sheriffSignup.entries()],
+      sheriffCandidates: [...this.sheriffCandidates],
+      sheriffWithdrawn: [...this.sheriffWithdrawn],
+      sheriffVotes: [...this.sheriffVotes.entries()],
+      sheriffTieCandidates: [...this.sheriffTieCandidates],
+      sheriffSpeechOrder: [...this.sheriffSpeechOrder],
+      sheriffElectionRound: this.sheriffElectionRound,
+      // 三态字段（undefined = 还没决定 / null = 决定放弃 / 数字 = 选了人）：
+      // JSON 序列化天然保留这个语义 —— undefined 的键会被丢掉，恢复时读不到就是 undefined。
+      sheriffTransferChoice: this.sheriffTransferChoice,
+      sheriffTransferFrom: this.sheriffTransferFrom,
+      sheriffTransferReturn: this.sheriffTransferReturn,
+      speechDirection: this.speechDirection,
+      deaths: this.deaths.map((d) => ({ ...d })),
+      lastNightDeaths: [...this.lastNightDeaths],
+      exiled: this.exiled ? { ...this.exiled } : null,
+      voteDetail: this.voteDetail.map((v) => ({ ...v })),
+      hunterPendingSeat: this.hunterPendingSeat,
+      hunterQueue: [...this.hunterQueue],
+      hunterChoice: this.hunterChoice,
+      hunterReturnPhase: this.hunterReturnPhase,
+      boomPendingSeat: this.boomPendingSeat,
+      boomChoice: this.boomChoice,
+      lastGuardedSeat: this.lastGuardedSeat,
+      puppetSeat: this.puppetSeat,
+      wolfTags: [...this.wolfTags.entries()],
+      wolfTagTargets: [...this.wolfTagTargets.entries()],
+      winner: this.winner,
+      draw: this.draw,
+      log: [...this.log],
+      secretLog: [...this.secretLog],
+      boomAnnouncements: [...this.boomAnnouncements],
+      replayNights: this.replayNights.map((n) => structuredClone(n)),
+      replayDayVotes: this.replayDayVotes.map((v) => ({ ...v, votes: v.votes.map((x) => ({ ...x })) })),
+      revealAllRequested: [...this.revealAllRequested],
+      speechStartSeat: this.speechStartSeat,
+      rngState: this.rng.state,
+      boardRoles: [...this.boardRoles],
+      puppetEnabled: this.puppetEnabled,
+    };
+  }
+
+  /**
+   * 从快照重建一局游戏。**不走构造函数**：构造函数会发牌、重置历史，
+   * 而恢复要的是「原样继续」。
+   *
+   * 版本不符或结构明显损坏时返回 null —— 调用方（hub）应丢弃这份快照，
+   * 宁可丢一局也不要加载出一个规则错乱的局。
+   */
+  static restore(input: unknown): Game | null {
+    if (typeof input !== 'object' || input === null) return null;
+    const snap = input as Partial<GameSnapshot>;
+    if (snap.v !== GAME_SNAPSHOT_VERSION) return null;
+    if (!Array.isArray(snap.players) || snap.players.length === 0) return null;
+    if (typeof snap.phase !== 'string' || !PHASE_NAMES.has(snap.phase)) return null;
+    if (typeof snap.roomId !== 'string') return null;
+    if (!Array.isArray(snap.boardRoles)) return null;
+    if (typeof snap.rngState !== 'number') return null;
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- readonly 字段只能绕过类型系统一次性写入
+      const g: any = Object.create(Game.prototype);
+      g.roomId = snap.roomId;
+      g.config = { ...DEFAULT_ROOM_CONFIG, ...(snap.config ?? {}) };
+      g.phase = snap.phase;
+      g.day = snap.day ?? 0;
+      g.deadline = snap.deadline ?? null;
+      g.countdown = snap.countdown ?? null;
+      g.countdownEndsAt = snap.countdownEndsAt ?? null;
+      g.holdAdvance = snap.holdAdvance === true;
+      g.onlineSeats = new Set<number>();
+      g.hostPlayerId = snap.hostPlayerId ?? null;
+      g.roleRevealConfirmed = new Set(snap.roleRevealConfirmed ?? []);
+      g.lastCharmedSeat = snap.lastCharmedSeat ?? null;
+      g.darkLordReflectUsed = snap.darkLordReflectUsed === true;
+      g.players = snap.players.map((p) => ({ ...p }));
+      const night = snap.night;
+      g.night = night
+        ? {
+          ...night,
+          wolfPicks: new Map(night.wolfPicks ?? []),
+          puppetPicks: new Map(night.puppetPicks ?? []),
+        }
+        : emptyNight();
+      g.witchPotions = snap.witchPotions ?? { antidote: true, poison: true };
+      g.seerHistory = new Map(snap.seerHistory ?? []);
+      g.spiritHistory = new Map(snap.spiritHistory ?? []);
+      g.hybridModelSeat = snap.hybridModelSeat ?? null;
+      g.mechanicalLearnedRole = snap.mechanicalLearnedRole ?? null;
+      g.mechanicalLearnedDay = snap.mechanicalLearnedDay ?? null;
+      g.mechanicalPoisonAvailable = snap.mechanicalPoisonAvailable !== false;
+      g.mechanicalLastGuardedSeat = snap.mechanicalLastGuardedSeat ?? null;
+      g.danceUsedSeats = new Set(snap.danceUsedSeats ?? []);
+      g.danceHistory = snap.danceHistory ?? [];
+      g.maskHistory = snap.maskHistory ?? [];
+      g.lastMaskInspectSeat = snap.lastMaskInspectSeat ?? null;
+      g.lastMaskTargetSeat = snap.lastMaskTargetSeat ?? null;
+      g.lastDreamedSeat = snap.lastDreamedSeat ?? null;
+      g.dreamHistory = snap.dreamHistory ?? [];
+      g.lastDayExiledSeat = snap.lastDayExiledSeat ?? null;
+      g.graveHistory = snap.graveHistory ?? [];
+      g.knightUsed = snap.knightUsed === true;
+      g.votes = new Map(snap.votes ?? []);
+      g.sheriffSeat = snap.sheriffSeat ?? null;
+      g.sheriffElectionFinished = snap.sheriffElectionFinished === true;
+      g.sheriffSignup = new Map(snap.sheriffSignup ?? []);
+      g.sheriffCandidates = new Set(snap.sheriffCandidates ?? []);
+      g.sheriffWithdrawn = new Set(snap.sheriffWithdrawn ?? []);
+      g.sheriffVotes = new Map(snap.sheriffVotes ?? []);
+      g.sheriffTieCandidates = snap.sheriffTieCandidates ?? [];
+      g.sheriffSpeechOrder = snap.sheriffSpeechOrder ?? [];
+      g.sheriffElectionRound = snap.sheriffElectionRound ?? 0;
+      g.sheriffTransferChoice = snap.sheriffTransferChoice;
+      g.sheriffTransferFrom = snap.sheriffTransferFrom ?? null;
+      g.sheriffTransferReturn = snap.sheriffTransferReturn ?? 'ANNOUNCE';
+      g.speechDirection = snap.speechDirection ?? null;
+      g.deaths = snap.deaths ?? [];
+      g.lastNightDeaths = snap.lastNightDeaths ?? [];
+      g.exiled = snap.exiled ?? null;
+      g.voteDetail = snap.voteDetail ?? [];
+      g.hunterPendingSeat = snap.hunterPendingSeat ?? null;
+      g.hunterQueue = snap.hunterQueue ?? [];
+      g.hunterChoice = snap.hunterChoice;
+      g.hunterReturnPhase = snap.hunterReturnPhase ?? 'DAY_VOTE';
+      g.boomPendingSeat = snap.boomPendingSeat ?? null;
+      g.boomChoice = snap.boomChoice;
+      g.lastGuardedSeat = snap.lastGuardedSeat ?? null;
+      g.puppetSeat = snap.puppetSeat ?? null;
+      g.wolfTags = new Map(snap.wolfTags ?? []);
+      g.wolfTagTargets = new Map(snap.wolfTagTargets ?? []);
+      g.winner = snap.winner ?? null;
+      g.draw = snap.draw === true;
+      g.log = snap.log ?? [];
+      g.secretLog = snap.secretLog ?? [];
+      g.boomAnnouncements = snap.boomAnnouncements ?? [];
+      g.replayNights = snap.replayNights ?? [];
+      g.replayDayVotes = snap.replayDayVotes ?? [];
+      g.revealAllRequested = new Set(snap.revealAllRequested ?? []);
+      g.speechStartSeat = snap.speechStartSeat ?? null;
+      g.rng = SeededRng.resume(snap.rngState);
+      // 下面几个构造期派生值从恢复后的牌面重算 —— 角色整局不变，重算结果与开局一致
+      g.initialGods = (g.players as PlayerState[]).filter((p) => isGod(p.role)).length;
+      g.initialVillagers = (g.players as PlayerState[]).filter(
+        (p) => p.role === 'VILLAGER' || p.role === 'HYBRID',
+      ).length;
+      g.deckSize = snap.boardRoles.length;
+      g.boardRoles = [...snap.boardRoles];
+      g.puppetEnabled = snap.puppetEnabled === true;
+      return g as Game;
+    } catch {
+      return null;
+    }
   }
 
   // ─────────────────── 查询辅助 ───────────────────
@@ -393,27 +928,85 @@ export class Game {
     return this.alivePlayers().map((p) => p.seat);
   }
 
-  /** 活着的狼（含白狼王） */
+  /**
+   * 玩家的**真实阵营**。
+   *
+   * 为什么要和「角色阵营」分开：傀儡保留原底牌（预言家/女巫/猎人/守卫/平民），
+   * 但他已经**属于狼人阵营**了 —— 他本人却不知道。
+   *
+   * 所以全项目分成两套：
+   *   - **真实阵营**（这个函数）→ 胜负判定、真预言家查验、守墓人、骑士决斗
+   *   - **角色阵营**（`isWolfRole(role)`）→ 傀儡自己看到的阵营、狼队互认
+   *
+   * 第二套必须是角色阵营：一旦让傀儡看到「阵营：狼人」，他立刻就知道自己中招，
+   * 这个板子唯一的设计目的（信息污染）就没了。同理，狼队互认也必须用角色阵营，
+   * 否则傀儡会看到三个狼队友。
+   */
+  private truthCamp(player: PlayerState): Camp {
+    if (player.seat === this.puppetSeat) return 'WOLF';
+    return isWolfRole(player.role) ? 'WOLF' : 'GOOD';
+  }
+
+  /** 某个座位的真实阵营（给只有座位号的地方用） */
+  private truthCampOfSeat(seat: number): Camp {
+    const player = this.bySeat(seat);
+    return player ? this.truthCamp(player) : 'GOOD';
+  }
+
+  /**
+   * 预言家（或机械狼复制的查验）**看到的**阵营。
+   *
+   * 傀儡的查验结果是**反的**：验真狼显示【好人】、验好人显示【狼人】。
+   * 这比「技能失效」狠得多 —— 他会拿着完全错误的结论，非常认真地帮倒忙。
+   *
+   * 注意：返回的是「他该看到什么」，调用方要把它同时写进
+   * `night.seerCamp` 和 `seerHistory`，两边必须一致。
+   */
+  private seerCampAsSeenBy(seer: PlayerState, target: PlayerState): Camp {
+    const truth = this.truthCamp(target);
+    if (seer.seat !== this.puppetSeat) return truth;
+    return truth === 'WOLF' ? 'GOOD' : 'WOLF';
+  }
+
+  /**
+   * 活着的**狼人阵营成员**（含傀儡）。
+   *
+   * 傀儡算进来是刻意的：他已经是狼人阵营，好人必须把他处理掉才能满足胜利条件
+   * （官方规则：即使三狼全部死亡，傀儡也不能接刀，但好人仍要清掉他）。
+   */
   private aliveWolves(): PlayerState[] {
-    return this.players.filter((p) => p.alive && isWolfRole(p.role));
+    return this.players.filter((p) => p.alive && this.truthCamp(p) === 'WOLF');
   }
 
   /** 真正参与当夜狼刀的玩家；机械狼只有学习狼人身份后的下一夜才加入。 */
+  /**
+   * 参与狼刀的成员：普通狼 / 白狼王 / 狼王，加上与狼互认的狼美人和恶灵骑士
+   * （官方规则：她们夜里和狼队一起睁眼点刀；她们自己不能被刀——见 KNIFE_EXEMPT_ROLES）。
+   */
   private aliveKnifeWolves(): PlayerState[] {
     return this.players.filter((p) => {
       if (!p.alive) return false;
-      if (p.role === 'WOLF' || p.role === 'WOLF_KING') return true;
+      if (p.role === 'WOLF' || p.role === 'WOLF_KING' || p.role === 'BLACK_WOLF_KING' ||
+        p.role === 'WOLF_BEAUTY' || p.role === 'DARK_LORD') return true;
       if (p.role === 'MASK') return this.maskHasKnife();
       return p.role === 'MECHANICAL_WOLF' && this.mechanicalSkillActive() &&
-        (this.mechanicalLearnedRole === 'WOLF' || this.mechanicalLearnedRole === 'WOLF_KING');
+        (this.mechanicalLearnedRole === 'WOLF' ||
+          this.mechanicalLearnedRole === 'WOLF_KING' ||
+          this.mechanicalLearnedRole === 'BLACK_WOLF_KING');
     });
   }
 
-  /** 普通狼（含尚未隔离的狼系角色）全部出局后，假面从下一次狼刀阶段起接刀。 */
+  /**
+   * 普通狼（含尚未隔离的狼系角色）全部出局后，假面从下一次狼刀阶段起接刀。
+   *
+   * 傀儡不算「普通狼」：他不能刀人、也永远不会接刀。
+   */
   private maskHasKnife(): boolean {
     const mask = this.aliveSole('MASK');
     if (!mask) return false;
-    return !this.players.some((p) => p.alive && p.role !== 'MASK' && isWolfRole(p.role));
+    return !this.players.some(
+      (p) => p.alive && p.role !== 'MASK' && p.seat !== this.puppetSeat && isWolfRole(p.role),
+    );
   }
 
   private dancerCandidates(): number[] {
@@ -430,9 +1023,12 @@ export class Game {
 
   private wolfSeats(): number[] {
     return this.players
-      .filter((p) => p.role === 'WOLF' || p.role === 'WOLF_KING' ||
+      .filter((p) => p.role === 'WOLF' || p.role === 'WOLF_KING' || p.role === 'BLACK_WOLF_KING' ||
+        p.role === 'WOLF_BEAUTY' || p.role === 'DARK_LORD' ||
         (p.role === 'MECHANICAL_WOLF' && this.mechanicalSkillActive() &&
-          (this.mechanicalLearnedRole === 'WOLF' || this.mechanicalLearnedRole === 'WOLF_KING')))
+          (this.mechanicalLearnedRole === 'WOLF' ||
+            this.mechanicalLearnedRole === 'WOLF_KING' ||
+            this.mechanicalLearnedRole === 'BLACK_WOLF_KING')))
       .map((p) => p.seat);
   }
 
@@ -444,10 +1040,19 @@ export class Game {
     return this.soleOf('MECHANICAL_WOLF');
   }
 
+  /**
+   * 「认识狼队」的判定：普通狼 / 白狼王 / 狼王互认；
+   * 狼美人和恶灵骑士按官方规则**与狼人互认**（夜里一起睁眼、一起参与点刀）。
+   * 唯一的例外是**假面**——她与普通狼不互认（暗狼设计，见她的角色说明），
+   * 只有普通狼全灭后接过刀权时才入队。机械狼学过狼系身份并生效后才入队。
+   */
   private knowsWolfPack(player: PlayerState): boolean {
-    return player.role === 'WOLF' || player.role === 'WOLF_KING' ||
+    return player.role === 'WOLF' || player.role === 'WOLF_KING' || player.role === 'BLACK_WOLF_KING' ||
+      player.role === 'WOLF_BEAUTY' || player.role === 'DARK_LORD' ||
       (player.role === 'MECHANICAL_WOLF' && this.mechanicalSkillActive() &&
-        (this.mechanicalLearnedRole === 'WOLF' || this.mechanicalLearnedRole === 'WOLF_KING'));
+        (this.mechanicalLearnedRole === 'WOLF' ||
+          this.mechanicalLearnedRole === 'WOLF_KING' ||
+          this.mechanicalLearnedRole === 'BLACK_WOLF_KING'));
   }
 
   private soleOf(role: Role): PlayerState | undefined {
@@ -502,9 +1107,84 @@ export class Game {
       );
     }
     this.day = 1;
+    // 发牌之后**不直接进夜晚**，先给所有人时间看清自己的身份牌。
+    //
+    // 为什么必须这样：第一夜第一个行动的角色是混血儿（首夜选榜样，不可逆），
+    // 他的能力说明光读就要十几秒。原来的流程是「房主点开始 → 立刻天黑 → 5 秒后
+    // 混血儿开始 30 秒倒计时」，等于逼人在没看懂规则的情况下做一个不可逆决定。
+    // 更普遍的危害是：同样 90 秒的狼人时间，对熟悉规则的人和不熟的人不等价 ——
+    // 时间在这里又一次决定了信息优势，只不过方向变成了「谁读得快谁占便宜」。
     this.pushLog(
-      `【第 1 天】天黑请闭眼，游戏开始。本局共 ${this.players.length} 人：${this.boardSummaryText()}。`,
+      `【第 1 天】本局共 ${this.players.length} 人：${this.boardSummaryText()}。请查看你的身份牌，全员确认后由房主开始第一夜。`,
     );
+    this.enter('ROLE_REVEAL');
+    return OK;
+  }
+
+  // ─────────────────── 身份确认（发牌之后、天黑之前） ───────────────────
+
+  /**
+   * 玩家表示「我已看清我的身份牌」。
+   *
+   * 服务端只能确认「这个人点过按钮」，无法确认他真的看了牌 ——
+   * 这是刻意的：想糊弄的人本来就会糊弄，加校验只是给自己找麻烦。
+   * 这个阶段真正的价值是**给时间**，不是**做审查**。
+   */
+  confirmRole(playerId: string): ActResult {
+    if (this.phase !== 'ROLE_REVEAL') return fail('BAD_PHASE', '现在不是查看身份牌阶段');
+    const me = this.byId(playerId);
+    if (!me) return fail('NOT_IN_ROOM', '你不在本局游戏中');
+    if (this.roleRevealConfirmed.has(playerId)) return fail('ALREADY_DONE', '你已经确认过了');
+    this.roleRevealConfirmed.add(playerId);
+    const left = this.pendingRoleRevealSeats().length;
+    if (left === 0) {
+      this.pushLog('所有人都已确认身份。等房主按下「天黑请闭眼」。');
+    }
+    return OK;
+  }
+
+  /** 还没确认的座位（按座位号升序，房主照着这个喊人） */
+  pendingRoleRevealSeats(): number[] {
+    return this.players
+      .filter((p) => !this.roleRevealConfirmed.has(p.id))
+      .map((p) => p.seat)
+      .sort((a, b) => a - b);
+  }
+
+  /** 已确认的座位 */
+  confirmedRoleRevealSeats(): number[] {
+    return this.players
+      .filter((p) => this.roleRevealConfirmed.has(p.id))
+      .map((p) => p.seat)
+      .sort((a, b) => a - b);
+  }
+
+  /**
+   * 硬门槛是否满足：**在线的人一个都不能少**。
+   *
+   * 为什么要给掉线的人豁免：门槛的本意是「不能有人在没看牌的情况下被推进夜晚」，
+   * 而掉线的人根本点不了按钮。如果把他算进门槛，12 人局里只要有一台手机没电，
+   * 全场就永久锁死 —— 房主唯一的出路变成踢人，那比放他过去糟糕得多。
+   * 他回来之后仍然能看牌、仍然能确认（只要还没天黑）。
+   */
+  canBeginNight(): boolean {
+    if (this.phase !== 'ROLE_REVEAL') return false;
+    // 拿不到在线信息时（测试、异常情况）退化成最严格：要求全员确认
+    const required =
+      this.onlineSeats.size > 0
+        ? this.players.filter((p) => this.onlineSeats.has(p.seat))
+        : this.players;
+    return required.every((p) => this.roleRevealConfirmed.has(p.id));
+  }
+
+  /** 房主按下「天黑请闭眼」—— 第一夜正式开始 */
+  beginNight(): ActResult {
+    if (this.phase !== 'ROLE_REVEAL') return fail('BAD_PHASE', '现在不是查看身份牌阶段');
+    if (!this.canBeginNight()) {
+      const pending = this.pendingRoleRevealSeats();
+      return fail('NOT_READY', `还有 ${pending.length} 人没确认身份：${pending.join('、')} 号`);
+    }
+    this.pushLog(`【第 1 天】天黑请闭眼，游戏开始。`);
     this.enter('NIGHT_START');
     return OK;
   }
@@ -579,6 +1259,20 @@ export class Game {
         this.settle();
         return OK;
       }
+      case 'dreamer': {
+        if (this.phase !== 'NIGHT_DREAMER') return fail('BAD_PHASE', '现在不是摄梦人行动阶段');
+        if (me.role !== 'DREAMER' || !me.alive) return fail('NOT_YOUR_TURN', '你不是存活的摄梦人');
+        if (this.night.dreamerActed) return fail('ALREADY_DONE', '你本夜已经选择过梦游者');
+        if (action.target === me.seat || !this.aliveSeats().includes(action.target)) {
+          return fail('INVALID_TARGET', '请选择另一名存活玩家作为梦游者');
+        }
+        this.night.dreamerTarget = action.target;
+        this.night.dreamerActed = true;
+        this.dreamHistory.push({ day: this.day, seat: action.target });
+        this.pushSecret(`摄梦人（${me.seat} 号）选择 ${action.target} 号成为梦游者`);
+        this.settle();
+        return OK;
+      }
       case 'wolf': {
         if (this.phase !== 'NIGHT_WOLVES') return fail('BAD_PHASE', '现在不是狼人行动阶段');
         if (!this.aliveKnifeWolves().some((wolf) => wolf.id === me.id)) {
@@ -587,7 +1281,37 @@ export class Game {
         if (action.target !== null && !this.aliveSeats().includes(action.target)) {
           return fail('INVALID_TARGET', '目标不是存活玩家');
         }
+        // 狼美人和恶灵骑士「不能自刀」：狼队不能把刀口指向他们。
+        // 在服务端拦住而不是只在界面上藏起来 —— 界面上藏是纸糊的。
+        if (action.target !== null && !this.knifeCandidates().includes(action.target)) {
+          const blocked = this.bySeat(action.target);
+          return fail(
+            'INVALID_TARGET',
+            `${action.target} 号（${blocked ? ROLE_NAME[blocked.role] : '?'}）不能自刀`,
+          );
+        }
         this.night.wolfPicks.set(me.seat, action.target);
+        /**
+         * 「唯邻是从」：首夜狼队在刀人的同时还要选一名**傀儡**。
+         *
+         * 首夜必须选（`puppet === undefined` 直接拒绝），因为不选就没法开局 ——
+         * 这个板子的全部玩法建立在那一次转化上。
+         * 选人范围由服务端校验（`puppetCandidates()`），界面上藏起来是没用的。
+         */
+        if (this.puppetCandidates().length > 0) {
+          const puppet = action.puppet;
+          if (puppet === undefined || puppet === null) {
+            return fail('INVALID_TARGET', '首夜必须选择一名傀儡（只能从与狼相邻的好人里选）');
+          }
+          if (!this.puppetCandidates().includes(puppet)) {
+            const blocked = this.bySeat(puppet);
+            return fail(
+              'INVALID_TARGET',
+              `${puppet} 号（${blocked ? ROLE_NAME[blocked.role] : '?'}）不能成为傀儡：只能选与狼相邻的好人`,
+            );
+          }
+          this.night.puppetPicks.set(me.seat, puppet);
+        }
         this.settle();
         return OK;
       }
@@ -636,6 +1360,10 @@ export class Game {
         this.night.witchSave = action.save;
         this.night.witchPoison = action.poison;
         this.night.witchActed = true;
+        // 毒恶灵骑士会反噬自己 —— 女巫是夜间最先行动的，所以她一定吃这一下
+        if (action.poison !== null && this.bySeat(action.poison)?.role === 'DARK_LORD') {
+          this.noteDarkLordReflect(witch);
+        }
         this.settle();
         return OK;
       }
@@ -650,11 +1378,16 @@ export class Game {
         if (!target || !target.alive) return fail('INVALID_TARGET', '目标不是存活玩家');
 
         this.night.seerTarget = target.seat;
-        this.night.seerCamp = isWolfRole(target.role) ? 'WOLF' : 'GOOD';
+        // 傀儡预言家的验人结果**相反**（这是「唯邻是从」的核心污染手段），
+        // 所以先算真实阵营，再决定要不要反转。写入 seerHistory 的必须是
+        // **反转后**的结果 —— 否则他按住身份牌翻历史，一对就发现自己是傀儡了。
+        this.night.seerCamp = this.seerCampAsSeenBy(me, target);
         this.night.seerActed = true;
         const history = this.seerHistory.get(seer.seat) ?? [];
         history.push({ seat: target.seat, camp: this.night.seerCamp });
         this.seerHistory.set(seer.seat, history);
+        // 查验恶灵骑士会被反伤 —— 而且结果是「狼」，等于用命换一条情报
+        if (target.role === 'DARK_LORD') this.noteDarkLordReflect(seer);
         this.settle();
         return OK;
       }
@@ -686,6 +1419,24 @@ export class Game {
         this.settle();
         return OK;
       }
+      case 'beautyCharm': {
+        if (this.phase !== 'NIGHT_BEAUTY_CHARM') {
+          return fail('BAD_PHASE', '现在不是狼美人魅惑阶段');
+        }
+        const beauty = this.soleOf('WOLF_BEAUTY');
+        if (!beauty || beauty.id !== me.id) return fail('NOT_YOUR_TURN', '你不是狼美人');
+        if (!beauty.alive) return fail('DEAD', '你已经出局');
+        if (this.night.beautyCharmActed) return fail('ALREADY_DONE', '你本夜已经魅惑过了');
+        if (action.target === beauty.seat) return fail('INVALID_TARGET', '不能魅惑自己');
+        const charmTarget = this.bySeat(action.target);
+        if (!charmTarget || !charmTarget.alive) return fail('INVALID_TARGET', '目标不是存活玩家');
+
+        this.night.beautyCharmTarget = charmTarget.seat;
+        this.night.beautyCharmActed = true;
+        this.pushSecret(`狼美人（${beauty.seat} 号）魅惑了 ${charmTarget.seat} 号`);
+        this.settle();
+        return OK;
+      }
       case 'spiritSeer': {
         if (this.phase !== 'NIGHT_SPIRIT_SEER') return fail('BAD_PHASE', '现在不是通灵师查验阶段');
         if (me.role !== 'SPIRIT_SEER' || !me.alive) return fail('NOT_YOUR_TURN', '你不是存活的通灵师');
@@ -698,6 +1449,7 @@ export class Game {
         const history = this.spiritHistory.get(me.seat) ?? [];
         history.push({ seat: target.seat, role: target.role });
         this.spiritHistory.set(me.seat, history);
+        if (target.role === 'DARK_LORD') this.noteDarkLordReflect(me);
         this.settle();
         return OK;
       }
@@ -727,7 +1479,7 @@ export class Game {
           const target = action.target === null ? undefined : this.bySeat(action.target);
           if (!target || !target.alive || target.seat === me.seat) return fail('INVALID_TARGET', '查验目标无效');
           this.night.mechanicalSeerTarget = target.seat;
-          this.night.mechanicalSeerCamp = isWolfRole(target.role) && target.role !== 'HYBRID' ? 'WOLF' : 'GOOD';
+          this.night.mechanicalSeerCamp = this.seerCampAsSeenBy(me, target);
           this.night.mechanicalSeerActed = true;
           const history = this.seerHistory.get(me.seat) ?? [];
           history.push({ seat: target.seat, camp: this.night.mechanicalSeerCamp });
@@ -744,6 +1496,17 @@ export class Game {
           history.push({ seat: target.seat, role: target.role });
           this.spiritHistory.set(me.seat, history);
         }
+        this.settle();
+        return OK;
+      }
+      case 'graveKeeper': {
+        if (this.phase !== 'NIGHT_GRAVE_KEEPER') return fail('BAD_PHASE', '现在不是守墓人行动阶段');
+        const keeper = this.soleOf('GRAVE_KEEPER');
+        if (!keeper || keeper.id !== me.id) return fail('NOT_YOUR_TURN', '你不是守墓人');
+        if (!keeper.alive) return fail('DEAD', '你已经出局');
+        if (this.night.graveKeeperActed) return fail('ALREADY_DONE', '你本夜已经确认过了');
+        this.night.graveKeeperActed = true;
+        // 结果在进入阶段时就已经写入 graveHistory，这里只是收束确认
         this.settle();
         return OK;
       }
@@ -845,10 +1608,10 @@ export class Game {
   }
 
   submitHunterShoot(playerId: string, target: number | null): ActResult {
-    if (this.phase !== 'HUNTER_SHOOT') return fail('BAD_PHASE', '现在不是猎人开枪阶段');
-    const hunter = this.byId(playerId);
-    if (!hunter || !this.canShootAsHunter(hunter)) return fail('NOT_YOUR_TURN', '你没有猎人开枪能力');
-    if (this.hunterPendingSeat !== hunter.seat) return fail('NOT_YOUR_TURN', '你当前不能开枪');
+    if (this.phase !== 'HUNTER_SHOOT') return fail('BAD_PHASE', '现在不是死亡开枪阶段');
+    const shooter = this.byId(playerId);
+    if (!shooter || !this.hasDeathShotAbility(shooter)) return fail('NOT_YOUR_TURN', '你没有死亡开枪能力');
+    if (this.hunterPendingSeat !== shooter.seat) return fail('NOT_YOUR_TURN', '你当前不能开枪');
     if (this.hunterChoice !== undefined) return fail('ALREADY_DONE', '你已经决定过了');
     if (target !== null && !this.aliveSeats().includes(target)) {
       return fail('INVALID_TARGET', '目标不是存活玩家');
@@ -856,17 +1619,41 @@ export class Game {
     this.hunterChoice = target;
     if (target !== null) {
       const tp = this.bySeat(target)!;
-      this.kill(tp, 'SHOOT');
-      this.pushLog(`猎人开枪带走了 ${target} 号（${tp.nickname}）。`);
+      if (this.isPuppet(shooter)) {
+        /**
+         * 傀儡猎人的枪是**哑的**：他能正常选人、开枪阶段照常走满，
+         * 但不会有人死。
+         *
+         * 为什么还要让他走完流程：直接跳过 `HUNTER_SHOOT` 阶段，全场立刻就知道
+         * 「这个猎人没枪 = 他是傀儡」。而「阶段永远走满、时长不携带信息」是这个项目的铁律，
+         * 让他照常演一遍，至少时序上不泄露；同时**他自己**会在这一刻发现枪是假的 ——
+         * 这正是这个板子要的体验。
+         *
+         * 公开日志里刻意**不写「带走了谁」**：那会留下一条"宣称杀了人却没死"的记录，
+         * 看起来像 bug。玩家从「开枪阶段出现了、但没人死」自然能推出真相。
+         */
+        this.pushSecret(`傀儡猎人 ${shooter.seat} 号开枪指向 ${target} 号，但枪是哑的`);
+      } else {
+        this.kill(tp, 'SHOOT');
+        this.pushLog(`${this.deathShooterName(shooter)}开枪带走了 ${target} 号（${tp.nickname}）。`);
+      }
     } else {
-      this.pushLog('猎人选择放弃开枪。');
+      this.pushLog(`${this.deathShooterName(shooter)}选择放弃开枪。`);
     }
     this.checkWinner();
     this.settle();
     return OK;
   }
 
-  /** 白狼王自爆（白天可用）：自爆后立刻进入黑夜，当天不再投票 */
+  /**
+   * 狼人自爆（白天可用）：自爆后立刻进入黑夜，当天不再发言与投票。
+   *
+   * - 白狼王：爆后进入带人阶段，可指定带走一名玩家（也可不带）
+   * - 普通狼人：空爆，不带人，爆完直接结算进黑夜
+   *
+   * 两者共同的规则：自爆发生在**警长竞选期间**时，竞选终止、本局警徽流失
+   * （官方规则）；警长已经选出后自爆不撕警徽，走正常的移交/撕毁流程。
+   */
   selfDestruct(playerId: string): ActResult {
     const daytime = new Set<Phase>([
       'SHERIFF_SIGNUP', 'SHERIFF_CAMPAIGN', 'SHERIFF_VOTE', 'SHERIFF_PK',
@@ -877,23 +1664,39 @@ export class Game {
     }
     const me = this.byId(playerId);
     if (!me) return fail('NOT_IN_ROOM', '你不在本局游戏中');
-    if (me.role !== 'WOLF_KING') return fail('NOT_YOUR_TURN', '你不是白狼王');
+    if (me.role !== 'WOLF_KING' && me.role !== 'WOLF') {
+      return fail('NOT_YOUR_TURN', '只有狼人可以自爆');
+    }
     if (!me.alive) return fail('DEAD', '你已经出局');
     if (this.boomPendingSeat !== null) return fail('ALREADY_DONE', '自爆已经发生过了');
 
     if (!this.sheriffElectionFinished) {
       this.sheriffElectionFinished = true;
       this.sheriffCandidates.clear();
-      this.pushLog('警长竞选因白狼王自爆中止，本局警徽流失。');
+      this.pushLog('警长竞选因狼人自爆中止，本局警徽流失。');
     }
     this.kill(me, 'EXPLODE');
-    this.pushLog(`${me.seat} 号（${me.nickname}）亮出【白狼王】，自爆！`);
-    this.boomPendingSeat = me.seat;
-    this.pushSecret(`白狼王（${me.seat} 号）自爆，进入指定带走目标阶段`);
-    // 有意不在这里判定胜负：白狼王先带人，带完之后再判 ——
-    // 这样「自爆带走最后一名平民 → 狼人胜」这类边缘情况才符合常规规则。
-    this.enter('WOLF_KING_BOOM');
-    this.settle();
+
+    if (me.role === 'WOLF_KING') {
+      this.pushLog(`${me.seat} 号（${me.nickname}）亮出【白狼王】，自爆！`);
+      this.boomPendingSeat = me.seat;
+      this.pushSecret(`白狼王（${me.seat} 号）自爆，进入指定带走目标阶段`);
+      // 有意不在这里判定胜负：白狼王先带人，带完之后再判 ——
+      // 这样「自爆带走最后一名平民 → 狼人胜」这类边缘情况才符合常规规则。
+      this.enter('WOLF_KING_BOOM');
+      this.settle();
+      return OK;
+    }
+
+    // 普通狼空爆：没有带人阶段，结算顺序与白狼王带完人之后完全一致。
+    // 空爆没有专属阶段可挂语音，写进公开播报队列，随紧随其后的天黑语音全场念出。
+    this.pushLog(`${me.seat} 号（${me.nickname}）亮出【狼人】身份，自爆！今天不再发言与投票。`);
+    this.pushSecret(`普通狼（${me.seat} 号）空爆，直接进入黑夜`);
+    this.boomAnnouncements.push(me.seat);
+    this.checkWinner();
+    if (this.isOver) this.enter('GAME_OVER');
+    else if (this.sheriffTransferFrom !== null) this.beginSheriffTransfer('BOOM');
+    else this.nextNight();
     return OK;
   }
 
@@ -921,13 +1724,65 @@ export class Game {
   }
 
   /**
+   * 骑士决斗（白天发言阶段，整局一次）。
+   *
+   * 规则：翻牌向一名玩家发起决斗 —— 对方是狼人则当场出局，是好人则骑士自己出局。
+   * 无论输赢技能都算用过。决斗出局不触发猎人/狼王开枪（DUEL 不在
+   * canTriggerDeathShot 的死因里），也不会引发狼美人殉情（见 kill()）。
+   *
+   * 为什么只在 DAY_SPEECH：投票阶段插进一场死亡会作废已经在飞的票，
+   * 警长竞选阶段死人会让刚生成的发言顺序当场作废 —— 发言阶段是
+   * 「听完发言、还没投票」的自然决斗时机，官方流程也是这么演的。
+   */
+  knightDuel(playerId: string, target: number): ActResult {
+    if (this.phase !== 'DAY_SPEECH') return fail('BAD_PHASE', '只有在白天发言阶段才能发起决斗');
+    const me = this.byId(playerId);
+    if (!me) return fail('NOT_IN_ROOM', '你不在本局游戏中');
+    if (me.role !== 'KNIGHT') return fail('NOT_YOUR_TURN', '你不是骑士');
+    if (!me.alive) return fail('DEAD', '你已经出局');
+    if (this.knightUsed) return fail('ALREADY_DONE', '你的决斗已经用过了');
+    if (target === me.seat) return fail('INVALID_TARGET', '不能和自己决斗');
+    const tp = this.bySeat(target);
+    if (!tp || !tp.alive) return fail('INVALID_TARGET', '目标不是存活玩家');
+
+    this.knightUsed = true;
+    const targetIsWolf = this.truthCamp(tp) === 'WOLF';
+    this.pushLog(`${me.seat} 号（${me.nickname}）亮出【骑士】，向 ${target} 号（${tp.nickname}）发起决斗！`);
+
+    if (targetIsWolf) {
+      this.kill(tp, 'DUEL');
+      this.pushLog(`决斗结果：${target} 号是狼人，被当场处决。当天的发言与投票继续。`);
+    } else {
+      this.kill(me, 'DUEL');
+      this.pushLog(`决斗结果：${target} 号是好人，骑士 ${me.seat} 号决斗失败，自己出局。当天的发言与投票继续。`);
+    }
+
+    this.checkWinner();
+    if (this.isOver) {
+      this.enter('GAME_OVER');
+    } else if (this.sheriffTransferFrom !== null) {
+      // 死的是警长（或骑士自己就是警长）：先移交警徽，再回到发言阶段。
+      // 重新 enter(DAY_SPEECH) 会让新警长重新指定发言方向，这正是想要的。
+      this.beginSheriffTransfer('SPEECH');
+    }
+    // 其余情况：阶段不变，当天照常发言、投票。
+    this.settle();
+    return OK;
+  }
+
+  /**
    * 给自己挂一个狼队战术标签（传 null 取消）。
    *
-   * 「悍跳位」是排他的：一队只能有一个人跳预言家，
-   * 所以别人占着的时候就拒绝，而不是静默把对方的标签抢走 ——
-   * 抢走会让对方以为自己还挂着，配合会直接出岔子。
+   * 三类标签的规则不一样：
+   *
+   *  - **全队唯一**（悍跳位 / 深水 / 倒钩 / 冲锋狼）：别人占着就**拒绝**，
+   *    而不是静默把对方的标签抢走 —— 抢走会让对方以为自己还挂着，配合直接出岔子。
+   *  - **自由**（上警）：想竞选警长的狼可以有好几个，不做限制。
+   *  - **两人配对**（狼踩狼）：还要带上「踩谁」，而且**对方也得反过来指你**，
+   *    配对才算成立。只有一边填就标成「待对方确认」——
+   *    否则挂的人会以为说好了，实际对方压根不知道。
    */
-  setWolfTag(playerId: string, tag: WolfTag | null): ActResult {
+  setWolfTag(playerId: string, tag: WolfTag | null, target: number | null = null): ActResult {
     const me = this.byId(playerId);
     if (!me) return fail('NOT_IN_ROOM', '你不在本局游戏中');
     if (!this.knowsWolfPack(me)) {
@@ -935,9 +1790,30 @@ export class Game {
     }
     if (this.phase === 'WAITING') return fail('BAD_PHASE', '游戏还没有开始');
     if (this.phase === 'GAME_OVER') return fail('BAD_PHASE', '本局已经结束了');
+    // 标签是「天黑之后」才存在的东西：身份确认阶段没有标签面板。
+    // 这同时保证了「谁是狼」不会在发牌那一刻就从界面上漏出去。
+    if (!this.phase.startsWith('NIGHT_')) {
+      return fail('BAD_PHASE', '狼队战术只能在夜间调整');
+    }
+
+    // 走到这里阶段一定是 NIGHT_*，所以「是不是第一夜」只看天数就够了。
+    //
+    // 悍跳位牵着战绩里的 +1 分，所以必须有人**在第一夜结束前**把它占住：
+    //   - 第一夜之内：随便点、随便取消、随便换人 —— 狼队本来就要在夜里来回商量谁去悍跳
+    //   - 第一夜之后：锁死，不能再挂（否则可以等狼队快赢了再挂上去白拿 +1 分）
+    // 别的标签没有这个时间约束，只受「全队唯一」或「两人互指」限制。
+    const firstNight = this.day === 1;
+
+    if (tag === 'FAKE_SEER' && !firstNight) {
+      return fail('BAD_PHASE', '悍跳位必须在第一夜结束前确定');
+    }
+    if (!firstNight && tag !== 'FAKE_SEER' && this.wolfTags.get(me.seat) === 'FAKE_SEER') {
+      return fail('ALREADY_DONE', '第一夜已经过去，悍跳位不能再改');
+    }
 
     if (tag === null) {
       this.wolfTags.delete(me.seat);
+      this.wolfTagTargets.delete(me.seat);
       return OK;
     }
 
@@ -947,13 +1823,54 @@ export class Game {
         const other = this.bySeat(holder[0]);
         return fail(
           'INVALID_TARGET',
-          `「悍跳位」已经由 ${holder[0]} 号（${other?.nickname ?? '?'}）占了，一队只能有一个人跳预言家`,
+          `「${WOLF_TAG_LABEL[tag]}」已经由 ${holder[0]} 号（${other?.nickname ?? '?'}）占了，一队只能有一个人`,
         );
       }
     }
 
+    if (isPairedWolfTag(tag)) {
+      const candidates = this.wolfTagTargetCandidates(me.seat);
+      if (target === null || !candidates.includes(target)) {
+        return fail(
+          'INVALID_TARGET',
+          candidates.length > 0
+            ? `「狼踩狼」必须再选一名存活的狼队友，可选：${candidates.join('、')} 号`
+            : '「狼踩狼」需要一名存活的狼队友，现在没有可选对象',
+        );
+      }
+      this.wolfTags.set(me.seat, tag);
+      this.wolfTagTargets.set(me.seat, target);
+      return OK;
+    }
+
     this.wolfTags.set(me.seat, tag);
+    this.wolfTagTargets.delete(me.seat);
     return OK;
+  }
+
+  /** 挂「狼踩狼」时可以踩谁：存活的狼队友（不含自己） */
+  private wolfTagTargetCandidates(mySeat: number): number[] {
+    return this.wolfSeats()
+      .filter((seat) => seat !== mySeat)
+      .filter((seat) => this.bySeat(seat)?.alive === true)
+      .sort((a, b) => a - b);
+  }
+
+  /**
+   * 狼踩狼的配对是否已经**双方互指**完成。
+   *
+   * 只有一边填了不算 —— 那正是「我以为说好了，其实对方不知道」的情况，
+   * 比不挂标签还危险，所以必须能被界面标出来。
+   */
+  wolfVsWolfPaired(seat: number): boolean {
+    const target = this.wolfTagTargets.get(seat);
+    if (target === undefined) return false;
+    return this.wolfTagTargets.get(target) === seat;
+  }
+
+  /** 仅供测试：读某个座位在「狼踩狼」里填的踩谁 */
+  wolfTagTargetAt(seat: number): number | null {
+    return this.wolfTagTargets.get(seat) ?? null;
   }
 
   /** 仅供测试：读某个座位的狼队标签 */
@@ -1000,7 +1917,17 @@ export class Game {
     switch (this.phase) {
       case 'NIGHT_WOLVES': {
         const wolves = this.aliveKnifeWolves();
-        return wolves.length > 0 && wolves.every((w) => this.night.wolfPicks.has(w.seat));
+        /**
+         * 狼队全灭时**必须算「已完成」**，否则这个阶段永远结算不了，整局冻死在夜里。
+         *
+         * 「唯邻是从」让这个边界第一次真的出现：三只真狼都出局了，
+         * 但傀儡还活着 —— 胜负没定、游戏继续，可已经没人能刀人了。
+         * 此前所有版型都不会走到这里（狼全死＝好人立刻获胜，不会再有下一夜），所以藏了很久。
+         *
+         * 注意这不影响「阶段照常走满时长」那条铁律：阶段该走多久还是多久，
+         * 只是没人能行动时不必干等所有人提交。
+         */
+        return wolves.length === 0 || wolves.every((w) => this.night.wolfPicks.has(w.seat));
       }
       case 'NIGHT_HYBRID':
         return this.night.hybridActed;
@@ -1010,6 +1937,10 @@ export class Game {
         return this.night.dancerActed;
       case 'NIGHT_MASK':
         return this.night.maskInspectActed && this.night.maskActed;
+      case 'NIGHT_DREAMER':
+        return this.night.dreamerActed;
+      case 'NIGHT_BEAUTY_CHARM':
+        return this.night.beautyCharmActed;
       case 'NIGHT_GUARD': {
         const normal = !!this.aliveSole('GUARD');
         const copied = !!this.mechanical()?.alive && this.mechanicalSkillActive() && this.mechanicalLearnedRole === 'GUARD';
@@ -1038,6 +1969,9 @@ export class Game {
           ? (!normal || this.night.spiritActed) && (!copied || this.night.mechanicalSpiritActed)
           : this.night.spiritActed && this.night.mechanicalSpiritActed;
       }
+      case 'NIGHT_GRAVE_KEEPER':
+        // 守墓人死了也一样等超时收束 —— 阶段空转满时长是「时间不泄密」的防火墙
+        return this.night.graveKeeperActed;
       case 'SHERIFF_SIGNUP': {
         const alive = this.alivePlayers();
         return alive.every((p) => this.sheriffSignup.has(p.seat));
@@ -1067,6 +2001,12 @@ export class Game {
   forceAdvance(byHost = false): void {
     if (this.phase === 'GAME_OVER' || this.phase === 'WAITING') return;
 
+    // 身份确认阶段**不允许被「跳过阶段」绕过**。
+    // 硬门槛的意义就是「不许有人在没看牌的情况下被打进夜晚」，
+    // 如果房主能用「跳过阶段」直接天黑，这个门槛等于不存在。
+    // 房主要开始夜晚只有一条路：等在线的人都确认，然后按「天黑请闭眼」。
+    if (this.phase === 'ROLE_REVEAL') return;
+
     if (byHost) this.pushLog(`房主跳过了【${PHASE_LABEL[this.phase]}】阶段。`);
 
     // 强制推进必须无视服务端设的「暂缓」。
@@ -1091,13 +2031,29 @@ export class Game {
         for (const w of wolves) {
           if (!this.night.wolfPicks.has(w.seat)) this.night.wolfPicks.set(w.seat, fallback);
         }
+        /**
+         * 傀儡同理：超时没选的话不能让这个板子的核心机制凭空消失。
+         * 优先跟随已有票数，全都没选就从候选人里随机取一个。
+         */
+        const candidates = this.puppetCandidates();
+        if (candidates.length > 0) {
+          const puppetVotes = [...this.night.puppetPicks.values()];
+          const puppetFallback =
+            puppetVotes.length > 0 ? plurality(puppetVotes) : candidates[Math.floor(this.rng.next() * candidates.length)]!;
+          if (puppetFallback !== null) {
+            for (const w of wolves) {
+              if (!this.night.puppetPicks.has(w.seat)) this.night.puppetPicks.set(w.seat, puppetFallback);
+            }
+            this.pushSecret(`狼队超时未选傀儡，系统替他们选了 ${puppetFallback} 号`);
+          }
+        }
         break;
       }
       case 'NIGHT_HYBRID': {
         if (!this.night.hybridActed) {
           const hybrid = this.aliveSole('HYBRID');
           const options = hybrid ? this.aliveSeats().filter((seat) => seat !== hybrid.seat) : [];
-          const target = options.length > 0 ? options[Math.floor(this.rng() * options.length)]! : null;
+          const target = options.length > 0 ? options[Math.floor(this.rng.next() * options.length)]! : null;
           this.night.hybridTarget = target;
           this.night.hybridActed = true;
           if (target !== null) this.hybridModelSeat = target;
@@ -1114,7 +2070,7 @@ export class Game {
             break;
           }
           const options = this.aliveSeats().filter((seat) => seat !== mechanical.seat);
-          const targetSeat = options.length > 0 ? options[Math.floor(this.rng() * options.length)]! : null;
+          const targetSeat = options.length > 0 ? options[Math.floor(this.rng.next() * options.length)]! : null;
           this.night.mechanicalLearnTarget = targetSeat;
           if (targetSeat !== null) {
             this.mechanicalLearnedRole = this.bySeat(targetSeat)?.role ?? null;
@@ -1126,7 +2082,7 @@ export class Game {
       }
       case 'NIGHT_DANCER': {
         if (!this.night.dancerActed) {
-          const options = shuffle(this.dancerCandidates(), this.rng);
+          const options = shuffle(this.dancerCandidates(), () => this.rng.next());
           const targets = options.length >= 3 && this.aliveSole('DANCER') ? options.slice(0, 3) : [];
           this.night.dancerTargets = targets;
           this.night.dancerActed = true;
@@ -1144,14 +2100,14 @@ export class Game {
         const mask = this.aliveSole('MASK');
         if (!this.night.maskInspectActed) {
           const options = this.maskInspectCandidates();
-          const target = mask && options.length > 0 ? options[Math.floor(this.rng() * options.length)]! : null;
+          const target = mask && options.length > 0 ? options[Math.floor(this.rng.next() * options.length)]! : null;
           this.night.maskInspectTarget = target;
           this.night.maskInspectResult = target !== null && this.night.dancerTargets.includes(target);
           this.night.maskInspectActed = true;
         }
         if (!this.night.maskActed) {
           const options = this.maskTargetCandidates();
-          this.night.maskTarget = mask && options.length > 0 ? options[Math.floor(this.rng() * options.length)]! : null;
+          this.night.maskTarget = mask && options.length > 0 ? options[Math.floor(this.rng.next() * options.length)]! : null;
           this.night.maskActed = true;
         }
         if (this.night.maskInspectTarget !== null && !this.maskHistory.some((entry) => entry.day === this.day)) {
@@ -1167,6 +2123,32 @@ export class Game {
         this.pushSecret('假面阶段超时，系统已随机完成剩余行动');
         break;
       }
+      case 'NIGHT_DREAMER': {
+        if (!this.night.dreamerActed) {
+          const dreamer = this.aliveSole('DREAMER');
+          const options = dreamer
+            ? this.aliveSeats().filter((seat) => seat !== dreamer.seat)
+            : [];
+          const target = options.length > 0 ? options[Math.floor(this.rng.next() * options.length)]! : null;
+          this.night.dreamerTarget = target;
+          this.night.dreamerActed = true;
+          if (target !== null) {
+            this.dreamHistory.push({ day: this.day, seat: target });
+            this.pushSecret(`摄梦人超时，系统随机选择 ${target} 号成为梦游者`);
+          } else {
+            this.pushSecret('摄梦人阶段无人可行动');
+          }
+        }
+        break;
+      }
+      case 'NIGHT_BEAUTY_CHARM':
+        // 超时未魅惑 = 本夜不魅惑。**不能**随机选一个 ——
+        // 那会让她在不知情的情况下把队友变成殉情对象。
+        if (!this.night.beautyCharmActed) {
+          this.night.beautyCharmActed = true;
+          this.pushSecret('狼美人超时未魅惑，本夜不魅惑任何人');
+        }
+        break;
       case 'NIGHT_GUARD':
         if (!this.night.guardActed) {
           this.night.guardActed = true;
@@ -1192,6 +2174,10 @@ export class Game {
         if (!this.night.spiritActed) this.night.spiritActed = true;
         if (!this.night.mechanicalSpiritActed) this.night.mechanicalSpiritActed = true;
         break;
+      case 'NIGHT_GRAVE_KEEPER':
+        // 超时只补「确认」：结果在进入阶段时已写入 graveHistory，挂机不丢信息
+        if (!this.night.graveKeeperActed) this.night.graveKeeperActed = true;
+        break;
       case 'SHERIFF_SIGNUP':
         for (const p of this.alivePlayers()) {
           if (!this.sheriffSignup.has(p.seat)) this.sheriffSignup.set(p.seat, false);
@@ -1211,7 +2197,8 @@ export class Game {
       case 'HUNTER_SHOOT':
         if (this.hunterChoice === undefined) {
           this.hunterChoice = null;
-          this.pushLog('猎人超时未开枪。');
+          const shooter = this.hunterPendingSeat === null ? undefined : this.bySeat(this.hunterPendingSeat);
+          this.pushLog(`${shooter ? this.deathShooterName(shooter) : '持枪玩家'}超时未开枪。`);
         }
         break;
       case 'WOLF_KING_BOOM':
@@ -1236,6 +2223,11 @@ export class Game {
     switch (this.phase) {
       case 'WAITING':
         return;
+      case 'ROLE_REVEAL':
+        // 只可能由房主按下「天黑请闭眼」走到这里（见 beginNight）。
+        // 不在 PAUSE_PHASES 之外的任何自动路径上 —— 身份确认永远不会自己结束。
+        this.enter('NIGHT_START');
+        return;
       case 'NIGHT_START':
         this.enter(this.nextNightPhase('NIGHT_START'));
         return;
@@ -1251,9 +2243,19 @@ export class Game {
       case 'NIGHT_MASK':
         this.enter(this.nextNightPhase('NIGHT_MASK'));
         return;
+      case 'NIGHT_DREAMER':
+        this.enter(this.nextNightPhase('NIGHT_DREAMER'));
+        return;
       case 'NIGHT_WOLVES':
         this.resolveWolfVotes();
+        // 狼人阶段一结束就把傀儡定下来（立刻生效）：
+        // 排在他后面的预言家当夜验他，看到的就该是【狼人】
+        this.applyPuppetVote();
         this.enter(this.nextNightPhase('NIGHT_WOLVES'));
+        return;
+      case 'NIGHT_BEAUTY_CHARM':
+        // 狼美人在狼刀之后独自睁眼 —— 她要先知道刀口才决定魅惑谁
+        this.enter(this.nextNightPhase('NIGHT_BEAUTY_CHARM'));
         return;
       case 'NIGHT_GUARD':
         this.enter(this.nextNightPhase('NIGHT_GUARD'));
@@ -1266,6 +2268,9 @@ export class Game {
         return;
       case 'NIGHT_SPIRIT_SEER':
         this.enter(this.nextNightPhase('NIGHT_SPIRIT_SEER'));
+        return;
+      case 'NIGHT_GRAVE_KEEPER':
+        this.enter(this.nextNightPhase('NIGHT_GRAVE_KEEPER'));
         return;
       case 'NIGHT_RESOLVE':
         this.enter('DAY_ANNOUNCE');
@@ -1322,6 +2327,7 @@ export class Game {
         if (returnTo === 'ANNOUNCE') this.continueAfterAnnounce();
         else if (returnTo === 'EXILE') this.continueAfterExile();
         else if (returnTo === 'HUNTER') this.continueAfterHunter();
+        else if (returnTo === 'SPEECH') this.enter('DAY_SPEECH');
         else this.nextNight();
         return;
       }
@@ -1331,19 +2337,85 @@ export class Game {
   }
 
   private continueAfterAnnounce(): void {
-    if (this.isOver) return void this.enter('GAME_OVER');
     if (this.sheriffTransferFrom !== null) return this.beginSheriffTransfer('ANNOUNCE');
     if (this.hunterPendingSeat !== null) {
       this.hunterReturnPhase = 'DAY_ANNOUNCE';
       return void this.enter('HUNTER_SHOOT');
     }
+    if (this.isOver) return void this.enter('GAME_OVER');
     if (this.day === 1 && !this.sheriffElectionFinished) return void this.enter('SHERIFF_SIGNUP');
     this.enter('DAY_SPEECH');
   }
 
-  private canShootAsHunter(player: PlayerState): boolean {
+  /** 是否拥有死亡开枪技能；具体死因是否允许开枪由 canTriggerDeathShot 判断。 */
+  private hasDeathShotAbility(player: PlayerState): boolean {
     return player.role === 'HUNTER' ||
+      player.role === 'BLACK_WOLF_KING' ||
       (player.role === 'MECHANICAL_WOLF' && this.mechanicalSkillActive() && this.mechanicalLearnedRole === 'HUNTER');
+  }
+
+  /**
+   * 恶灵骑士的反伤登记。
+   *
+   * 女巫毒他、预言家或通灵师查验他 → **对方**在天亮时死亡。
+   * 这里只登记「谁吃了这一下」，真正的死亡交给 `resolveNightDeaths()` 统一处理 ——
+   * 因为死讯必须出现在天亮公告里，而在提交阶段直接杀的死人不在公告名单上。
+   *
+   * 两个约束：
+   *  - **整局只反一次**（官方的「一次性反伤」）。用掉之后他依然夜里杀不死，
+   *    但剩下的毒药和查验都能放心用了。
+   *  - 「同一夜多人对他动手，只有**先行动**的那个人吃反伤」是靠**阶段顺序**
+   *    天然实现的：女巫阶段在预言家阶段之前，所以女巫先登记，后面的查验不再覆盖。
+   */
+  private noteDarkLordReflect(actor: PlayerState): void {
+    if (this.darkLordReflectUsed) return;
+    if (this.night.darkLordReflectVictim !== null) return;
+    this.night.darkLordReflectVictim = actor.seat;
+    this.pushSecret(`${actor.seat} 号对恶灵骑士动手，将在天亮时遭到反伤`);
+  }
+
+  /**
+   * 可以下刀的目标：存活、且不是「不能自刀」的狼（狼美人 / 恶灵骑士）。
+   *
+   * 官方规定这两个角色不能自刀 —— 不是礼节，是他们的价值全在活着：
+   * 狼美人要活到关键回合带人殉情，恶灵骑士要活着消耗好人的毒药和查验。
+   * 被自己队友一刀带走就全废了。
+   */
+  private knifeCandidates(): number[] {
+    return this.aliveSeats().filter((seat) => {
+      const p = this.bySeat(seat);
+      return p ? canBeKnifed(p.role) : false;
+    });
+  }
+
+  /**
+   * 狼美人的殉情结算：返回应该陪葬的座位。
+   *
+   * 只有**前一晚**被魅惑的人会殉情（这是官方规则，也是「今晚刚魅惑完就死、
+   * 那个人不该陪葬」的原因）。取走之后就清空 —— 同一次出局只带一个人。
+   */
+  private takeLovePactVictim(): number | null {
+    const charmed = this.lastCharmedSeat;
+    this.lastCharmedSeat = null;
+    if (charmed === null) return null;
+    const victim = this.bySeat(charmed);
+    if (!victim || !victim.alive) return null;
+    return charmed;
+  }
+
+  private canTriggerDeathShot(player: PlayerState, cause: DeathCause): boolean {    if (!this.hasDeathShotAbility(player)) return false;
+    if (player.role === 'BLACK_WOLF_KING') {
+      return cause === 'WOLF' || cause === 'VOTE' || cause === 'SHOOT';
+    }
+    // 官方狼王摄梦人规则：猎人被狼王的死亡开枪带走时仍可开枪，形成枪链。
+    // 摄梦、毒杀、舞池结算和白狼王自爆带人仍然压枪。
+    return cause === 'WOLF' || cause === 'VOTE' || cause === 'SHOOT';
+  }
+
+  private deathShooterName(player: PlayerState): string {
+    if (player.role === 'BLACK_WOLF_KING') return '狼王';
+    if (player.role === 'MECHANICAL_WOLF') return '继承猎人技能的机械狼';
+    return '猎人';
   }
 
   /** 白痴本体，或已经激活白痴技能的机械狼，均可在被放逐时翻牌免死。 */
@@ -1358,12 +2430,12 @@ export class Game {
   }
 
   private continueAfterExile(): void {
-    if (this.isOver) return void this.enter('GAME_OVER');
     if (this.sheriffTransferFrom !== null) return this.beginSheriffTransfer('EXILE');
     if (this.hunterPendingSeat !== null) {
       this.hunterReturnPhase = 'NIGHT_START';
       return void this.enter('HUNTER_SHOOT');
     }
+    if (this.isOver) return void this.enter('GAME_OVER');
     this.nextNight();
   }
 
@@ -1374,7 +2446,7 @@ export class Game {
     else this.continueAfterAnnounce();
   }
 
-  private beginSheriffTransfer(returnTo: 'ANNOUNCE' | 'EXILE' | 'HUNTER' | 'BOOM'): void {
+  private beginSheriffTransfer(returnTo: 'ANNOUNCE' | 'EXILE' | 'HUNTER' | 'BOOM' | 'SPEECH'): void {
     this.sheriffTransferReturn = returnTo;
     this.enter('SHERIFF_TRANSFER');
   }
@@ -1389,9 +2461,9 @@ export class Game {
     const seats = this.currentSheriffCandidates();
     if (seats.length === 0) return this.finishSheriffElection(null, '无人上警，警徽流失。');
     if (seats.length === 1) return this.finishSheriffElection(seats[0]!, '只有一人上警，自动当选警长。');
-    const start = Math.floor(this.rng() * seats.length);
+    const start = Math.floor(this.rng.next() * seats.length);
     const rotated = [...seats.slice(start), ...seats.slice(0, start)];
-    this.sheriffSpeechOrder = this.rng() < 0.5 ? rotated : rotated.reverse();
+    this.sheriffSpeechOrder = this.rng.next() < 0.5 ? rotated : rotated.reverse();
     this.enter('SHERIFF_CAMPAIGN');
   }
 
@@ -1457,29 +2529,19 @@ export class Game {
   /**
    * 本局夜晚需要走的角色阶段序列。
    *
-   * **只看公开的板子配置** —— 板子是开局前就公示的，所以「本局有守卫」
-   * 这件事本身不含任何隐藏信息。绝对不能掺进「守卫死没死」「女巫还有没有药」。
+   * 顺序**不再写在这里** —— 它由 `roles.ts` 的 `nightOrderFor()` 决定，
+   * 再用 `NIGHT_PHASE_BY_ROLE` 翻成阶段名。
+   *
+   * 为什么要把顺序挪出去：自定义版型界面必须告诉玩家「狼美人在第几个环节睁眼」，
+   * 而那个说明如果和引擎各写一份，早晚会对不上 —— 而顺序错了整个板子就废了，
+   * 12 人局当场根本没人能发现。现在两边共用同一份数据，只有一种可能：一致。
    */
   private nightSequence(): Phase[] {
     const seq: Phase[] = [];
-    if (this.day === 1 && this.boardRoles.includes('HYBRID')) seq.push('NIGHT_HYBRID');
-    if (this.boardRoles.includes('MECHANICAL_WOLF')) {
-      seq.push('NIGHT_MECHANICAL');
+    for (const role of nightOrderFor(this.boardRoles, this.day)) {
+      const phase = NIGHT_PHASE_BY_ROLE[role];
+      if (phase) seq.push(phase);
     }
-    // 舞者和假面首夜都不行动，从第二夜开始固定为舞者 → 假面。
-    if (this.day >= 2 && this.boardRoles.includes('DANCER')) seq.push('NIGHT_DANCER');
-    if (this.day >= 2 && this.boardRoles.includes('MASK')) seq.push('NIGHT_MASK');
-    if (this.boardRoles.includes('MECHANICAL_WOLF')) {
-      // 机械狼板采用“守卫 → 狼刀”的固定顺序；普通旧板仍保持原来的“狼刀 → 守卫”。
-      if (this.boardRoles.includes('GUARD')) seq.push('NIGHT_GUARD');
-      seq.push('NIGHT_WOLVES');
-    } else {
-      seq.push('NIGHT_WOLVES');
-      if (this.boardRoles.includes('GUARD')) seq.push('NIGHT_GUARD');
-    }
-    if (this.boardRoles.includes('WITCH')) seq.push('NIGHT_WITCH');
-    if (this.boardRoles.includes('SEER')) seq.push('NIGHT_SEER');
-    if (this.boardRoles.includes('SPIRIT_SEER')) seq.push('NIGHT_SPIRIT_SEER');
     return seq;
   }
 
@@ -1526,6 +2588,71 @@ export class Game {
     this.night.wolfTarget = plurality(picks);
   }
 
+  // ────────────────── 傀儡（「唯邻是从」） ──────────────────
+
+  /**
+   * 首夜狼队能选谁当傀儡：**与任意一只狼相邻的好人**。
+   *
+   * 这就是板子名字「唯邻是从」的来历 —— 不能全场随便点一个人，
+   * 只能从狼的邻居里挑。相邻按**环形**算（1 号和 12 号是邻居），
+   * 因为面杀是围坐一圈。
+   *
+   * 只做一次：傀儡定下之后就不再产生候选人（`puppetSeat` 一锁，这里返回空）。
+   */
+  private puppetCandidates(): number[] {
+    if (!this.puppetEnabled) return [];
+    if (this.puppetSeat !== null) return [];
+    if (this.day !== 1) return [];
+    const seats = this.players.map((p) => p.seat).sort((a, b) => a - b);
+    if (seats.length === 0) return [];
+    const min = seats[0]!;
+    const max = seats[seats.length - 1]!;
+    const neighbours = (seat: number): number[] => [
+      seat === min ? max : seat - 1,
+      seat === max ? min : seat + 1,
+    ];
+
+    const out = new Set<number>();
+    for (const wolf of this.aliveKnifeWolves()) {
+      for (const seat of neighbours(wolf.seat)) {
+        const player = this.bySeat(seat);
+        if (!player || !player.alive) continue;
+        // 只能选好人：狼的邻居如果还是狼，没有意义
+        if (this.truthCamp(player) === 'WOLF') continue;
+        out.add(seat);
+      }
+    }
+    return [...out].sort((a, b) => a - b);
+  }
+
+  /**
+   * 首夜狼队投出的傀儡 → 真正生效。
+   *
+   * **立刻生效**（而不是等天亮）：这样当夜排在狼人之后的预言家验他，
+   * 看到的就是【狼人】；如果傀儡是守卫/女巫/预言家，他当夜的技能也已经异常了。
+   */
+  private applyPuppetVote(): void {
+    if (this.puppetSeat !== null) return;
+    const picks = [...this.night.puppetPicks.values()];
+    if (picks.length === 0) return;
+    const chosen = plurality(picks);
+    if (chosen === null) return;
+    if (!this.puppetCandidates().includes(chosen)) return;
+    this.puppetSeat = chosen;
+    this.night.puppetTarget = chosen;
+    const player = this.bySeat(chosen);
+    // 只进私有日志：这是全场最不能泄露的一条信息
+    this.pushSecret(
+      `首夜狼队选中 ${chosen} 号（${player ? ROLE_NAME[player.role] : '?'}）作为傀儡，` +
+        `他本人不知情，技能已暗中失效/反转`,
+    );
+  }
+
+  /** 傀儡的某个技能是否已经不可信（失效或反转） */
+  private isPuppet(player: PlayerState): boolean {
+    return player.seat === this.puppetSeat;
+  }
+
   /** 进入新阶段并执行该阶段的入场结算 */
   private enter(phase: Phase): void {
     this.phase = phase;
@@ -1534,6 +2661,8 @@ export class Game {
       case 'NIGHT_START': {
         this.night = emptyNight();
         this.votes = new Map();
+        // 抄一份「昨天放逐了谁」再清空 —— 守墓人在本夜要查它
+        this.lastDayExiledSeat = this.exiled?.seat ?? null;
         this.exiled = null;
         this.voteDetail = [];
         this.hunterChoice = undefined;
@@ -1547,6 +2676,10 @@ export class Game {
       }
       case 'NIGHT_MASK': {
         this.pushLog('假面请睁眼，请先查验舞池，再选择一名玩家戴上面具。');
+        break;
+      }
+      case 'NIGHT_DREAMER': {
+        this.pushLog('摄梦人请睁眼，请选择今晚的梦游者。');
         break;
       }
       case 'NIGHT_WOLVES': {
@@ -1577,11 +2710,39 @@ export class Game {
         this.pushLog('通灵师请睁眼，请选择今晚要查验具体身份的玩家。');
         break;
       }
+      case 'NIGHT_GRAVE_KEEPER': {
+        this.pushLog('守墓人请睁眼。');
+        // 结果在阶段开始时就告诉他 —— 不依赖他点「我已知晓」，
+        // 这样挂机超时也不会丢信息；提交只是让阶段正常收束的确认。
+        // 已出局的守墓人不补录：死人不再获得新情报（阶段照常空转满时长）。
+        const seat = this.lastDayExiledSeat;
+        const target = seat === null ? undefined : this.bySeat(seat);
+        const check: { seat: number | null; isWolf: boolean } = {
+          seat,
+          // 用真实阵营：傀儡被放逐时，守墓人查到的应该是【狼人】。
+          // （混血儿对查验类技能一律显示好人 —— isWolfRole(HYBRID) = false）
+          isWolf: target ? this.truthCamp(target) === 'WOLF' : false,
+        };
+        this.night.graveCheck = check;
+        const keeper = this.aliveSole('GRAVE_KEEPER');
+        if (keeper) {
+          this.graveHistory.push({ day: this.day, seat, isWolf: check.isWolf });
+          this.pushSecret(
+            seat === null
+              ? '守墓人：昨天没有人被投票放逐'
+              : `守墓人查验昨日放逐者 ${seat} 号：${check.isWolf ? '狼人' : '好人'}`,
+          );
+        }
+        break;
+      }
       case 'NIGHT_RESOLVE': {
         this.resolveNightDeaths();
         break;
       }
       case 'DAY_ANNOUNCE': {
+        // 上一夜的「X 号自爆」播报已经随 NIGHT_START 语音念完了，白天开始前清掉，
+        // 下一轮自爆重新积累（写入在 selfDestruct → nextNight 之前）。
+        this.boomAnnouncements = [];
         if (this.lastNightDeaths.length === 0) {
           this.pushLog(`【第 ${this.day} 天】天亮了。昨晚是平安夜，无人死亡。`);
         } else {
@@ -1590,14 +2751,13 @@ export class Game {
             .join('、');
           this.pushLog(`【第 ${this.day} 天】天亮了。昨晚死亡的是：${names}。`);
         }
-        // 猎人被狼刀死可以开枪；被毒死不能
+        // 开枪机会已经在 kill() 中按角色和死因入队；天亮只记录提示，不重复入队。
         for (const seat of this.lastNightDeaths) {
           const p = this.bySeat(seat);
           if (!p) continue;
           const cause = this.deathCauseOf(seat);
-          if (this.canShootAsHunter(p) && cause === 'WOLF') {
-            this.queueHunter(seat);
-            this.pushSecret(`猎人（${seat} 号）在夜里出局，可获得开枪机会`);
+          if (cause && this.canTriggerDeathShot(p, cause)) {
+            this.pushSecret(`${this.deathShooterName(p)}（${seat} 号）在夜里出局，可获得开枪机会`);
           }
         }
         this.checkWinner();
@@ -1653,7 +2813,8 @@ export class Game {
       }
       case 'HUNTER_SHOOT': {
         this.hunterChoice = undefined;
-        this.pushLog('猎人出局，可以开枪带走一名玩家。');
+        const shooter = this.hunterPendingSeat === null ? undefined : this.bySeat(this.hunterPendingSeat);
+        this.pushLog(`${shooter ? this.deathShooterName(shooter) : '玩家'}出局，可以开枪带走一名玩家。`);
         break;
       }
       case 'WOLF_KING_BOOM': {
@@ -1685,13 +2846,35 @@ export class Game {
   }
 
   private resolveNightDeaths(): void {
-    /** 死因优先级：毒 > 舞池 > 狼刀。 */
+    /** 基础死因优先级：毒 > 舞池 > 狼刀；摄梦结算最后覆盖梦游者。 */
     const causes = new Map<number, DeathCause>();
     const wolfTarget = this.night.wolfTarget;
-    const guardTargets = [this.night.guardTarget, this.night.mechanicalGuardTarget].filter(
-      (seat): seat is number => seat !== null,
-    );
-    const witchSaved = this.night.witchSave;
+    const dreamer = this.aliveSole('DREAMER');
+    const dreamTarget = this.night.dreamerTarget;
+
+    /**
+     * ── 傀儡的技能异常，全部在**结算**这一层处理 ──
+     *
+     * 为什么不在提交时就把字段清空：傀儡的界面必须照常显示
+     * 「已使用解药」「已守护 5 号」—— 他在提交那一刻就得看到正常的反馈，
+     * 否则他当场就知道自己中招了，信息污染就没了。
+     * 所以「记录照常、生效作废」：字段照写，只是不允许它影响结果。
+     */
+    const guard = this.soleOf('GUARD');
+    const witch = this.soleOf('WITCH');
+    /** 傀儡守卫：守护照选，但完全不生效（狼刀照样落下去） */
+    const guardIsPuppet = guard !== undefined && this.isPuppet(guard);
+    /** 傀儡女巫：两瓶药照用，但都不产生效果 */
+    const witchIsPuppet = witch !== undefined && this.isPuppet(witch);
+
+    const guardTargets = [
+      guardIsPuppet ? null : this.night.guardTarget,
+      this.night.mechanicalGuardTarget,
+    ].filter((seat): seat is number => seat !== null);
+    /** 生效的解药（傀儡的解药不挡刀） */
+    const witchSaved = witchIsPuppet ? false : this.night.witchSave;
+    /** 是否消耗解药：只看**用没用**，不看有没有效 —— 傀儡的药也扣掉 */
+    const witchAntidoteUsed = this.night.witchSave;
     const dancer = this.soleOf('DANCER');
     const danceProtected = new Set<number>(
       dancer && this.night.dancerTargets.includes(dancer.seat) ? this.night.dancerTargets : [],
@@ -1725,7 +2908,7 @@ export class Game {
     if (this.night.dancerTargets.length === 3) {
       const camps = this.night.dancerTargets.map((seat) => {
         const player = this.bySeat(seat)!;
-        let camp: Camp = isWolfRole(player.role) ? 'WOLF' : 'GOOD';
+        let camp: Camp = this.truthCamp(player);
         if (seat === this.night.maskTarget) camp = camp === 'WOLF' ? 'GOOD' : 'WOLF';
         return { seat, camp };
       });
@@ -1741,13 +2924,18 @@ export class Game {
     }
 
     if (this.night.witchPoison !== null) {
-      // 舞者与假面免疫毒药，但毒药仍会被消耗。
-      const target = this.bySeat(this.night.witchPoison);
-      if (target?.role === 'DANCER' || target?.role === 'MASK') {
-        this.pushSecret(`女巫对 ${this.night.witchPoison} 号使用毒药，但该角色免疫毒药`);
+      if (witchIsPuppet) {
+        // 傀儡女巫的毒药下肚了、界面也显示「已使用」，但**不产生任何效果**
+        this.pushSecret(`傀儡女巫 ${witch?.seat ?? '?'} 号对 ${this.night.witchPoison} 号使用毒药，但药是假的`);
       } else {
-        causes.set(this.night.witchPoison, 'POISON');
-        this.pushSecret(`女巫使用毒药毒杀 ${this.night.witchPoison} 号`);
+        // 舞者与假面免疫毒药，但毒药仍会被消耗。
+        const target = this.bySeat(this.night.witchPoison);
+        if (target?.role === 'DANCER' || target?.role === 'MASK') {
+          this.pushSecret(`女巫对 ${this.night.witchPoison} 号使用毒药，但该角色免疫毒药`);
+        } else {
+          causes.set(this.night.witchPoison, 'POISON');
+          this.pushSecret(`女巫使用毒药毒杀 ${this.night.witchPoison} 号`);
+        }
       }
     }
     if (this.night.mechanicalPoison !== null && this.mechanicalPoisonAvailable) {
@@ -1763,19 +2951,118 @@ export class Game {
       );
     }
 
+    // ── 摄梦结算 ──
+    // 梦游者不会得知自己被选中，并免疫本夜狼刀、毒药和舞池等夜间伤害；
+    // 但“连续两夜摄梦同一人”和“摄梦人夜里死亡”会直接令其以 DREAM 死因出局。
+    if (dreamer && dreamTarget !== null) {
+      const blockedCause = causes.get(dreamTarget);
+      if (blockedCause) {
+        causes.delete(dreamTarget);
+        this.pushSecret(`梦游者 ${dreamTarget} 号免疫了本夜的【${DEATH_CAUSE_LABEL[blockedCause]}】`);
+      }
+
+      const consecutive = this.lastDreamedSeat === dreamTarget;
+      const dreamerDies = causes.has(dreamer.seat);
+      if (consecutive) {
+        causes.set(dreamTarget, 'DREAM');
+        this.pushSecret(`${dreamTarget} 号连续两夜成为梦游者，被摄梦人带走`);
+      } else if (dreamerDies) {
+        causes.set(dreamTarget, 'DREAM');
+        this.pushSecret(`摄梦人 ${dreamer.seat} 号夜里死亡，梦游者 ${dreamTarget} 号一同出局`);
+      }
+      this.lastDreamedSeat = dreamTarget;
+    }
+
     // ── 消耗药水 ──
-    if (witchSaved && wolfTarget !== null) this.witchPotions.antidote = false;
+    // 注意用 `witchAntidoteUsed` 而不是生效的 `witchSaved`：
+    // 傀儡女巫的解药**虽然没用**，但也要扣掉 —— 否则他能反复"救"同一晚，
+    // 一试就知道药是假的。
+    if (witchAntidoteUsed && wolfTarget !== null) this.witchPotions.antidote = false;
     if (this.night.witchPoison !== null) this.witchPotions.poison = false;
 
     // ── 记下守卫这一夜守了谁（供下一夜判断「不能连续守同一人」） ──
     if (this.night.guardTarget !== null) this.lastGuardedSeat = this.night.guardTarget;
     if (this.night.mechanicalGuardTarget !== null) this.mechanicalLastGuardedSeat = this.night.mechanicalGuardTarget;
 
+    // ── 恶灵骑士结算 ──
+    //
+    // ① 反伤：夜里对他动手的女巫/预言家/通灵师，天亮时死亡。
+    //    放在这里而不是提交时，是因为死讯必须进天亮公告 ——
+    //    `kill()` 是在下面算完 `lastNightDeaths` 之后才跑的。
+    if (this.night.darkLordReflectVictim !== null && !this.darkLordReflectUsed) {
+      const victim = this.night.darkLordReflectVictim;
+      this.darkLordReflectUsed = true;
+      if (this.bySeat(victim)?.alive) {
+        causes.set(victim, 'REFLECT');
+        this.pushSecret(`${victim} 号遭到恶灵骑士反伤出局`);
+      }
+    }
+
+    // ② 「夜里不会死亡」：所有夜间伤害对他无效，而且**连公告都不能把他列进去**
+    //    （否则会出现「昨晚死亡的是 7 号」但 7 号明明还活着）。
+    //    殉情（LOVE）不算夜间伤害 —— 那是羁绊不是攻击，官方也没把它算进来。
+    for (const seat of [...causes.keys()]) {
+      const p = this.bySeat(seat);
+      const cause = causes.get(seat)!;
+      if (p && p.role === 'DARK_LORD' && cause !== 'LOVE') {
+        causes.delete(seat);
+        this.pushSecret(`恶灵骑士 ${seat} 号免疫了本夜的【${DEATH_CAUSE_LABEL[cause]}】`);
+      }
+    }
+
+    // ── 狼美人殉情 ──
+    // 她夜里出局时，**前一晚**被她魅惑的人陪葬，且殉情者不能发动技能。
+    // 同样必须在这里追加进 causes，否则天亮公告会漏掉殉情者。
+    const beauty = this.soleOf('WOLF_BEAUTY');
+    if (beauty && causes.has(beauty.seat)) {
+      const charmed = this.takeLovePactVictim();
+      if (charmed !== null) {
+        causes.set(charmed, 'LOVE');
+        this.pushSecret(`狼美人 ${beauty.seat} 号夜里出局，${charmed} 号殉情`);
+      }
+    }
+
     this.lastNightDeaths = [...causes.keys()].sort((a, b) => a - b);
     for (const seat of this.lastNightDeaths) {
       const p = this.bySeat(seat);
       if (p) this.kill(p, causes.get(seat)!, true);
     }
+
+    // 本夜新魅惑的人从**下一夜**起才生效 —— 殉情只带「前一晚」那个。
+    // 必须放在上面的 kill 循环**之后**：kill() 里还有一个殉情钩子
+    // （负责白天出局的情形，前提是「夜结算已清空 lastCharmedSeat」），
+    // 若在此之前更新，狼美人当夜出局会把本夜刚魅惑的人也误带走。
+    this.lastCharmedSeat = this.night.beautyCharmTarget;
+
+    this.replayNights.push({
+      day: this.day,
+      wolfVotes: [...this.night.wolfPicks.entries()]
+        .map(([voter, target]) => ({ voter, target }))
+        .sort((a, b) => a.voter - b.voter),
+      wolfTarget: this.night.wolfTarget,
+      guardTarget: this.night.guardTarget,
+      mechanicalGuardTarget: this.night.mechanicalGuardTarget,
+      witchActed: this.night.witchActed,
+      witchSave: this.night.witchSave,
+      witchPoison: this.night.witchPoison,
+      mechanicalPoison: this.night.mechanicalPoison,
+      seerTarget: this.night.seerTarget,
+      seerCamp: this.night.seerCamp,
+      mechanicalSeerTarget: this.night.mechanicalSeerTarget,
+      mechanicalSeerCamp: this.night.mechanicalSeerCamp,
+      spiritTarget: this.night.spiritTarget,
+      spiritRole: this.night.spiritRole,
+      mechanicalSpiritTarget: this.night.mechanicalSpiritTarget,
+      mechanicalSpiritRole: this.night.mechanicalSpiritRole,
+      dancerTargets: this.night.dancerTargets.slice(),
+      maskInspectTarget: this.night.maskInspectTarget,
+      maskInspectResult: this.night.maskInspectResult,
+      maskTarget: this.night.maskTarget,
+      dreamerTarget: this.night.dreamerTarget,
+      beautyCharmTarget: this.night.beautyCharmTarget,
+      graveCheck: this.night.graveCheck ? { ...this.night.graveCheck } : null,
+      deaths: this.lastNightDeaths.map((seat) => ({ seat, cause: causes.get(seat)! })),
+    });
   }
 
   private resolveExile(): void {
@@ -1783,6 +3070,10 @@ export class Game {
     this.voteDetail = entries
       .map(([voter, target]) => ({ voter, target, weight: voter === this.sheriffSeat ? 1.5 : 1 }))
       .sort((a, b) => a.voter - b.voter);
+    this.replayDayVotes.push({
+      day: this.day,
+      votes: this.voteDetail.map((vote) => ({ ...vote })),
+    });
 
     const totals = new Map<number, number>();
     for (const [voter, target] of entries) {
@@ -1813,9 +3104,8 @@ export class Game {
 
     this.kill(p, 'VOTE');
     this.pushLog(`${p.seat} 号（${p.nickname}）被投票放逐出局。`);
-    if (this.canShootAsHunter(p)) {
-      this.queueHunter(p.seat);
-      this.pushLog('被放逐的是猎人，猎人可以开枪带走一名玩家。');
+    if (this.canTriggerDeathShot(p, 'VOTE')) {
+      this.pushLog(`被放逐的是${this.deathShooterName(p)}，可以开枪带走一名玩家。`);
     }
     this.checkWinner();
   }
@@ -1824,18 +3114,57 @@ export class Game {
     if (!p.alive) return;
     p.alive = false;
     this.deaths.push({ seat: p.seat, cause, day: this.day, night });
+    if (this.canTriggerDeathShot(p, cause)) this.queueHunter(p.seat);
     if (p.seat === this.sheriffSeat) {
       this.sheriffSeat = null;
       this.sheriffTransferFrom = p.seat;
+    }
+    // 狼美人出局 → 前一晚被魅惑的人殉情。
+    //
+    // 夜里出局的情况上面已经在 causes 里处理过了（那边必须提前处理，死讯才进得了
+    // 天亮公告），此时 lastCharmedSeat 已被清空，所以这里取到 null，不会重复。
+    // 这里真正负责的是**白天出局**：被放逐、被开枪、被白狼王带走。
+    //
+    // 例外：被骑士决斗处决不触发殉情（官方规则，她的角色说明里写明了这一条）。
+    if (p.role === 'WOLF_BEAUTY' && cause !== 'DUEL') {
+      const charmed = this.takeLovePactVictim();
+      if (charmed !== null) this.killByLovePact(charmed, night);
+    }
+  }
+
+  /**
+   * 殉情出局。
+   *
+   * 有意**不走 `kill()`**：官方规定殉情者不能发动技能，
+   * 而 `kill()` 会给猎人/狼王排队开枪。所以这里手写一份「死亡」，
+   * 唯一的区别就是不给开枪机会。
+   */
+  private killByLovePact(seat: number, night: boolean): void {
+    const victim = this.bySeat(seat);
+    if (!victim || !victim.alive) return;
+    victim.alive = false;
+    this.deaths.push({ seat, cause: 'LOVE', day: this.day, night });
+    this.pushLog(`${seat} 号（${victim.nickname}）为狼美人殉情，不能发动技能。`);
+    if (seat === this.sheriffSeat) {
+      this.sheriffSeat = null;
+      this.sheriffTransferFrom = seat;
     }
   }
 
   private checkWinner(): void {
     if (this.winner) return;
     const wolves = this.aliveWolves().length;
-    const gods = this.players.filter((p) => p.alive && isGod(p.role)).length;
+    /**
+     * 屠边名额**不含傀儡**：他已经属于狼人阵营，不再是神也不再是民。
+     *
+     * 换句话说，如果傀儡原本是预言家，好人这边的神只剩 3 个 ——
+     * 狼队杀光这 3 个就屠神成功，不需要多杀傀儡一次。
+     * 而傀儡自己那一票要算在 `aliveWolves()` 里（好人必须清掉他），
+     * 两件事是分开判的，别写混。
+     */
+    const gods = this.players.filter((p) => p.alive && p.seat !== this.puppetSeat && isGod(p.role)).length;
     const villagers = this.players.filter(
-      (p) => p.alive && (p.role === 'VILLAGER' || p.role === 'HYBRID'),
+      (p) => p.alive && p.seat !== this.puppetSeat && (p.role === 'VILLAGER' || p.role === 'HYBRID'),
     ).length;
 
     if (wolves === 0) {
@@ -1869,6 +3198,9 @@ export class Game {
   }
 
   private resultCampFor(player: PlayerState): Camp {
+    // 傀儡按**真实阵营**计分：他最终确实是跟着狼队赢的。
+    // 这也是整局结束、真相揭晓的时刻 —— 让他（和所有人）看到这一点正是这个板子的戏剧性所在。
+    if (player.seat === this.puppetSeat) return 'WOLF';
     if (player.role === 'HYBRID' && this.hybridModelSeat !== null) {
       const model = this.bySeat(this.hybridModelSeat);
       return model && isWolfRole(model.role) ? 'WOLF' : 'GOOD';
@@ -1926,6 +3258,25 @@ export class Game {
     return this.secretLog;
   }
 
+  /** 仅供服务端在保存已结束/提前结束的场次时调用。 */
+  replaySnapshot(): MatchReplay {
+    return {
+      version: 1,
+      nights: this.replayNights.map((night) => ({
+        ...night,
+        wolfVotes: night.wolfVotes.map((vote) => ({ ...vote })),
+        dancerTargets: night.dancerTargets.slice(),
+        deaths: night.deaths.map((death) => ({ ...death })),
+      })),
+      dayVotes: this.replayDayVotes.map((round) => ({
+        day: round.day,
+        votes: round.votes.map((vote) => ({ ...vote })),
+      })),
+      publicEvents: this.log.slice(),
+      secretEvents: this.secretLog.slice(),
+    };
+  }
+
   // ─────────────────── 视图（信息过滤的核心） ───────────────────
 
   /** 房间座位视图：自己与狼队友可见身份，其余人只见公开信息 */
@@ -1974,7 +3325,16 @@ export class Game {
     }
 
     switch (this.phase) {
+      case 'ROLE_REVEAL':
+        // 全场同一句，不含任何身份信息。
+        // 尤其不能出现「请神职确认」这种按阵营分批喊人的说法 —— 那等于用喇叭点名。
+        return '请查看你的身份牌，看清你的角色和能力。全员确认后，由房主开始第一夜。';
       case 'NIGHT_START':
+        // 自爆/空爆是白天发生的公开事件：全场播报谁爆了（见 selfDestruct）。
+        // 排除法不泄露「是谁」的任何私有信息 —— 自爆者已经亮牌，日志同样公示。
+        if (this.boomAnnouncements.length > 0) {
+          return `天黑请闭眼。${this.boomAnnouncements.join('、')} 号自爆了，今天不再发言与投票。现在是第 ${this.day} 天夜晚。`;
+        }
         return `天黑请闭眼。现在是第 ${this.day} 天夜晚。`;
       case 'NIGHT_RESOLVE': {
         // 最后一个夜间角色也要明确念到闭眼，否则玩家会怀疑阶段被吞掉了
@@ -2009,8 +3369,10 @@ export class Game {
         return '本轮投票没有产生放逐对象。';
       case 'SHERIFF_TRANSFER':
         return '警长出局，请选择移交警徽或撕毁警徽。';
-      case 'HUNTER_SHOOT':
-        return '猎人出局，请选择是否开枪带走一名玩家。';
+      case 'HUNTER_SHOOT': {
+        const shooter = this.hunterPendingSeat === null ? undefined : this.bySeat(this.hunterPendingSeat);
+        return `${shooter ? this.deathShooterName(shooter) : '玩家'}出局，请选择是否开枪带走一名玩家。`;
+      }
       case 'WOLF_KING_BOOM':
         return '白狼王自爆，请选择要带走的玩家。';
       case 'GAME_OVER':
@@ -2021,9 +3383,114 @@ export class Game {
     }
   }
 
-  gameViewFor(playerId: string): GameView {
-    const me = this.byId(playerId);
+  /**
+   * 当前阶段该播报的**片段序列**（录音语音包用）。
+   *
+   * 和 `voiceLineFor()` 是同一段话的两种表达：
+   *   - `voiceLineFor()` → 整句文字，浏览器 TTS 兜底时念它
+   *   - `voiceCuesFor()` → 片段序列，语音包按顺序播；数字单独成段、句子之间留停顿
+   *
+   * **两者用词必须一致**（`engine.test.ts` 有测试逐阶段比对），
+   * 否则「语音包里念的」和「没装语音包时念的」会不一样，
+   * 而这种不一致只有听的人才发现得了。
+   */
+  voiceCuesFor(): VoiceCue[] {
+    const seq = this.nightSequence();
+
+    const openId = OPEN_CLIP[this.phase];
+    if (openId) {
+      const idx = seq.indexOf(this.phase);
+      const prev = idx > 0 ? seq[idx - 1] : undefined;
+      const closeId = prev ? CLOSE_CLIP[prev] : undefined;
+      const cues: VoiceCue[] = [];
+      // 「上一个角色闭眼」和「本角色睁眼」拆成两段，中间留一个停顿 ——
+      // 这正是录音包比 TTS 好听的关键：法官会在这里停顿一下。
+      if (closeId) cues.push({ clip: closeId }, { pause: SENTENCE_GAP_MS });
+      cues.push({ clip: openId });
+      return cues;
+    }
+
+    switch (this.phase) {
+      case 'ROLE_REVEAL':
+        return [{ clip: 'reveal.tip' }];
+      case 'NIGHT_START': {
+        const cues: VoiceCue[] = [
+          { clip: 'night.fall' },
+          { pause: SENTENCE_GAP_MS },
+        ];
+        // 白天的自爆/空爆在这里公开播报（与 voiceLineFor 的 NIGHT_START 文本一致）
+        for (const seat of this.boomAnnouncements) {
+          cues.push({ num: seat }, { clip: 'boom.plainTail' }, { pause: SENTENCE_GAP_MS });
+        }
+        cues.push({ clip: 'night.now' }, { num: this.day }, { clip: 'night.dayTail' });
+        return cues;
+      }
+      case 'NIGHT_RESOLVE': {
+        const last = seq[seq.length - 1];
+        const closeId = last ? CLOSE_CLIP[last] : undefined;
+        const cues: VoiceCue[] = [];
+        if (closeId) cues.push({ clip: closeId }, { pause: SENTENCE_GAP_MS });
+        cues.push({ clip: 'night.almost' });
+        return cues;
+      }
+      case 'DAY_ANNOUNCE':
+        if (this.lastNightDeaths.length === 0) {
+          return [{ clip: 'day.break' }, { pause: SENTENCE_GAP_MS }, { clip: 'day.safe' }];
+        }
+        return [
+          { clip: 'day.break' },
+          { pause: SENTENCE_GAP_MS },
+          { clip: 'day.deathsHead' },
+          ...seatsCues(this.lastNightDeaths, 'day.seatTail'),
+        ];
+      case 'SHERIFF_SIGNUP':
+        return [{ clip: 'sheriff.start' }];
+      case 'SHERIFF_CAMPAIGN':
+        return [
+          { clip: 'sheriff.candHead' },
+          ...seatsCues(this.currentSheriffCandidates(), 'sheriff.candTail'),
+        ];
+      case 'SHERIFF_VOTE':
+        return [{ clip: 'sheriff.vote' }];
+      case 'SHERIFF_PK':
+        return [
+          { clip: 'sheriff.pkHead' },
+          ...seatsCues(this.currentSheriffCandidates(), 'sheriff.pkTail'),
+        ];
+      case 'SHERIFF_REVOTE':
+        return [{ clip: 'sheriff.revote' }];
+      case 'DAY_SPEECH':
+        return [{ clip: this.sheriffSeat === null ? 'day.speech' : 'day.speechSheriff' }];
+      case 'DAY_VOTE':
+        return [{ clip: 'day.vote' }];
+      case 'DAY_EXILE':
+        if (!this.exiled) return [{ clip: 'day.noExile' }];
+        return [{ num: this.exiled.seat }, { clip: 'day.exiledTail' }];
+      case 'SHERIFF_TRANSFER':
+        return [{ clip: 'sheriff.transfer' }];
+      case 'HUNTER_SHOOT': {
+        const shooter = this.hunterPendingSeat === null ? undefined : this.bySeat(this.hunterPendingSeat);
+        if (!shooter) return [{ clip: 'shooter.player' }];
+        if (shooter.role === 'HUNTER') return [{ clip: 'shooter.hunter' }];
+        if (shooter.role === 'BLACK_WOLF_KING') return [{ clip: 'shooter.wolfking' }];
+        if (shooter.role === 'MECHANICAL_WOLF') return [{ clip: 'shooter.mechanical' }];
+        return [{ clip: 'shooter.player' }];
+      }
+      case 'WOLF_KING_BOOM':
+        return [{ clip: 'boom.out' }];
+      case 'GAME_OVER':
+        if (this.draw && !this.winner) return [{ clip: 'over.draw' }];
+        if (this.winner === 'WOLF') return [{ clip: 'over.wolf' }];
+        if (this.winner === 'GOOD') return [{ clip: 'over.good' }];
+        return [{ clip: 'over.plain' }];
+      default:
+        return [];
+    }
+  }
+
+  gameViewFor(playerId: string): GameView {    const me = this.byId(playerId);
     const wolf = me ? this.knowsWolfPack(me) : false;
+    const wolfNight = wolf && this.phase.startsWith('NIGHT_');
 
     const view: GameView = {
       phase: this.phase,
@@ -2033,6 +3500,19 @@ export class Game {
       deadline: this.deadline,
       countdown: this.countdown,
       countdownEndsAt: this.countdownEndsAt,
+      // 身份确认阶段的进度与门槛。只在这一阶段下发。
+      ...(this.phase === 'ROLE_REVEAL'
+        ? {
+            roleReveal: {
+              confirmedSeats: this.confirmedRoleRevealSeats(),
+              pendingSeats: this.pendingRoleRevealSeats(),
+              total: this.players.length,
+              iConfirmed: Boolean(playerId) && this.roleRevealConfirmed.has(playerId),
+              iAmHost: Boolean(playerId) && playerId === this.hostPlayerId,
+              canBeginNight: this.canBeginNight(),
+            },
+          }
+        : {}),
       me: me ? this.meView(me) : null,
       myTurn: this.isMyTurn(me),
       myOptions: this.optionsFor(me),
@@ -2055,9 +3535,14 @@ export class Game {
       exiled: this.exiled,
       boomPendingSeat: this.boomPendingSeat,
       hunterPendingSeat: this.hunterPendingSeat,
+      shooterRoleName:
+        this.phase === 'HUNTER_SHOOT' && this.hunterPendingSeat !== null
+          ? this.deathShooterName(this.bySeat(this.hunterPendingSeat)!)
+          : null,
       winner: this.phase === 'GAME_OVER' ? this.winner : null,
       outcome: this.phase === 'GAME_OVER' ? this.outcome() : null,
       voiceLine: this.voiceLineFor(),
+      voiceCues: this.voiceCuesFor(),
       log: this.log.slice(-60),
       ...(this.canSeeProgress(me) ? { progress: this.progressFor(me) } : {}),
       voteDetail: this.voteDetail.slice(),
@@ -2066,13 +3551,9 @@ export class Game {
         : ['DAY_SPEECH', 'DAY_VOTE'].includes(this.phase)
           ? { speechOrder: this.speechOrder() }
           : {}),
-      // 狼队夜间的点刀情况只下发给狼人 —— 用于线上协作，好人拿不到
-      ...(wolf
+      // 防窥屏不仅靠前端隐藏：白天服务端不向任何页面下发狼队战术数据。
+      ...(wolfNight
         ? {
-            wolfVotes: [...this.night.wolfPicks.entries()]
-              .map(([seat, target]) => ({ seat, target }))
-              .sort((a, b) => a.seat - b.seat),
-            // 战术标签同理：狼队友互相看得见，好人一律看不到
             wolfTags: this.wolfSeats()
               .slice()
               .sort((a, b) => a - b)
@@ -2080,7 +3561,42 @@ export class Game {
                 seat,
                 nickname: this.bySeat(seat)?.nickname ?? '?',
                 tag: this.wolfTags.get(seat) ?? null,
+                // 狼踩狼：填的「踩谁」以及这一对有没有互指成功
+                target: this.wolfTagTargets.get(seat) ?? null,
+                paired: this.wolfVsWolfPaired(seat),
               })),
+          }
+        : {}),
+      // 点刀选择只在真正的狼人行动阶段下发，避免其他夜间身份阶段提前露出。
+      ...(wolf && this.phase === 'NIGHT_WOLVES'
+        ? {
+            wolfVotes: [...this.night.wolfPicks.entries()]
+              .map(([seat, target]) => ({ seat, target }))
+              .sort((a, b) => a.seat - b.seat),
+          }
+        : {}),
+      /**
+       * 「唯邻是从」的傀儡信息：**只给狼队**，而且整局都下发。
+       *
+       * 为什么不像 wolfVotes 那样只限狼人阶段：三狼需要**一直记得**首夜选了谁 ——
+       * 他们得避开刀他、还要在发言里配合他。只在首夜下发的话，天亮以后就忘了。
+       * 候选人/投票只在首夜有意义，其余时候给空数组。
+       *
+       * 条件里的 `wolf` 是关键：漏掉它，傀儡（一个好人）就会收到这份视图，
+       * 他看一眼就知道自己中招了。
+       */
+      ...(wolf && this.puppetEnabled
+        ? {
+            puppetInfo: {
+              candidates: this.phase === 'NIGHT_WOLVES' ? this.puppetCandidates() : [],
+              votes:
+                this.phase === 'NIGHT_WOLVES'
+                  ? [...this.night.puppetPicks.entries()]
+                      .map(([seat, target]) => ({ seat, target }))
+                      .sort((a, b) => a.seat - b.seat)
+                  : [],
+              chosen: this.puppetSeat,
+            },
           }
         : {}),
       // 守卫专属：上一夜守了谁（界面要标出来，避免玩家误点导致提交被拒）
@@ -2153,6 +3669,14 @@ export class Game {
         : `查验结果：${this.night.maskInspectTarget} 号${this.night.maskInspectResult ? '【在舞池】' : '【不在舞池】'}。现在请选择一名玩家戴上面具。`;
     }
 
+    if (me?.role === 'GRAVE_KEEPER' && this.phase === 'NIGHT_GRAVE_KEEPER') {
+      const check = this.night.graveCheck;
+      if (check && check.seat !== null) {
+        const who = this.bySeat(check.seat);
+        view.phaseHint = `查验结果：昨天被放逐的 ${check.seat} 号（${who?.nickname ?? '?'}）是${check.isWolf ? '【狼人】' : '【好人】'}。`;
+      }
+    }
+
     return view;
   }
 
@@ -2184,6 +3708,35 @@ export class Game {
           ? { seat: this.night.maskInspectTarget, inDance: this.night.maskInspectResult === true }
           : null,
         maskNeedsDisguise: this.phase === 'NIGHT_MASK' && this.night.maskInspectActed && !this.night.maskActed,
+      };
+    }
+    if (me.role === 'DREAMER') {
+      return {
+        ...base,
+        dreamHistory: this.dreamHistory.map((entry) => ({
+          day: entry.day,
+          seat: entry.seat,
+          nickname: this.bySeat(entry.seat)?.nickname ?? '?',
+        })),
+        lastDreamedSeat: this.lastDreamedSeat,
+      };
+    }
+    if (me.role === 'WOLF_BEAUTY') {
+      // 她必须知道自己上一夜魅惑了谁 —— 那个人就是她死后要陪葬的人。
+      // 互认规则：她和狼队互相认识。这个分支提前 return，走不到下面
+      // isWolfRole 的通用狼队字段，所以队友名单和夜间战术标签在这里补齐。
+      return {
+        ...base,
+        lastCharmedSeat: this.lastCharmedSeat,
+        teammates: this.wolfSeats().filter((seat) => seat !== me.seat),
+        ...(this.phase.startsWith('NIGHT_')
+          ? {
+              myWolfTag: this.wolfTags.get(me.seat) ?? null,
+              myWolfTagTarget: this.wolfTagTargets.get(me.seat) ?? null,
+              myWolfTagTargets: this.wolfTagTargetCandidates(me.seat),
+              canEditWolfTag: me.alive,
+            }
+          : {}),
       };
     }
     if (me.role === 'SPIRIT_SEER') {
@@ -2222,16 +3775,24 @@ export class Game {
           ...common,
           ...histories,
           teammates: this.wolfSeats().filter((seat) => seat !== me.seat),
-          myWolfTag: this.wolfTags.get(me.seat) ?? null,
-          canEditWolfTag: me.alive && this.phase !== 'GAME_OVER',
+          ...(this.phase.startsWith('NIGHT_')
+            ? {
+                myWolfTag: this.wolfTags.get(me.seat) ?? null,
+                myWolfTagTarget: this.wolfTagTargets.get(me.seat) ?? null,
+                myWolfTagTargets: this.wolfTagTargetCandidates(me.seat),
+                canEditWolfTag: me.alive,
+              }
+            : {}),
         };
       }
       return { ...common, ...histories };
     }
     if (isWolfRole(me.role)) {
       const teammates = this.wolfSeats().filter((s) => s !== me.seat);
+      // 白狼王（可带人）与普通狼人（空爆）都能自爆；界面用 me.role 区分文案。
+      // 其余狼营角色（狼王/机械狼/假面/狼美人）没有自爆按钮。
       const extra: { canSelfDestruct?: boolean } = {};
-      if (me.role === 'WOLF_KING') {
+      if (me.role === 'WOLF_KING' || me.role === 'WOLF') {
         extra.canSelfDestruct =
           me.alive &&
           ['SHERIFF_SIGNUP', 'SHERIFF_CAMPAIGN', 'SHERIFF_VOTE', 'SHERIFF_PK', 'SHERIFF_REVOTE', 'DAY_SPEECH', 'DAY_VOTE'].includes(this.phase) &&
@@ -2240,13 +3801,37 @@ export class Game {
       return {
         ...base,
         teammates,
-        myWolfTag: this.wolfTags.get(me.seat) ?? null,
-        canEditWolfTag: me.alive && this.phase !== 'GAME_OVER',
+        ...(this.phase.startsWith('NIGHT_')
+          ? {
+              myWolfTag: this.wolfTags.get(me.seat) ?? null,
+              myWolfTagTarget: this.wolfTagTargets.get(me.seat) ?? null,
+              myWolfTagTargets: this.wolfTagTargetCandidates(me.seat),
+              canEditWolfTag: me.alive,
+            }
+          : {}),
         ...extra,
       };
     }
     if (me.role === 'WITCH') {
       return { ...base, potions: { ...this.witchPotions } };
+    }
+    if (me.role === 'GRAVE_KEEPER') {
+      return {
+        ...base,
+        graveHistory: this.graveHistory.map((entry) => ({
+          day: entry.day,
+          seat: entry.seat,
+          nickname: entry.seat === null ? null : this.bySeat(entry.seat)?.nickname ?? null,
+          isWolf: entry.isWolf,
+        })),
+      };
+    }
+    if (me.role === 'KNIGHT') {
+      return {
+        ...base,
+        knightUsed: this.knightUsed,
+        canDuel: me.alive && !this.knightUsed && this.phase === 'DAY_SPEECH',
+      };
     }
     if (me.role === 'SEER') {
       const history = (this.seerHistory.get(me.seat) ?? []).map((h) => ({
@@ -2282,8 +3867,21 @@ export class Game {
         return this.night.maskInspectActed
           ? (this.night.maskActed ? [] : this.maskTargetCandidates())
           : this.maskInspectCandidates();
+      case 'NIGHT_DREAMER':
+        return me.role === 'DREAMER' && me.alive
+          ? this.aliveSeats().filter((seat) => seat !== me.seat)
+          : [];
       case 'NIGHT_WOLVES':
-        return this.aliveKnifeWolves().some((wolf) => wolf.id === me.id) ? this.aliveSeats() : [];
+        return this.aliveKnifeWolves().some((wolf) => wolf.id === me.id) ? this.knifeCandidates() : [];
+      case 'NIGHT_BEAUTY_CHARM': {
+        const beauty = this.soleOf('WOLF_BEAUTY');
+        if (!beauty || beauty.id !== me.id || !beauty.alive) return [];
+        if (this.night.beautyCharmActed) return [];
+        return this.aliveSeats().filter((seat) => seat !== beauty.seat);
+      }
+      // 守墓人没有目标可选 —— 他的「行动」只是确认已看到结果
+      case 'NIGHT_GRAVE_KEEPER':
+        return [];
       case 'NIGHT_GUARD': {
         if (me.role === 'MECHANICAL_WOLF' && this.mechanicalSkillActive() && this.mechanicalLearnedRole === 'GUARD') {
           return this.aliveSeats().filter((seat) => seat !== this.mechanicalLastGuardedSeat);
@@ -2319,7 +3917,7 @@ export class Game {
       case 'SHERIFF_TRANSFER':
         return this.sheriffTransferFrom === me.seat ? this.aliveSeats() : [];
       case 'HUNTER_SHOOT': {
-        if (!this.canShootAsHunter(me) || this.hunterPendingSeat !== me.seat) return [];
+        if (!this.hasDeathShotAbility(me) || this.hunterPendingSeat !== me.seat) return [];
         return this.aliveSeats().filter((s) => s !== me.seat);
       }
       case 'WOLF_KING_BOOM': {
@@ -2342,6 +3940,12 @@ export class Game {
         return me.role === 'DANCER' && me.alive && !this.night.dancerActed && this.dancerCandidates().length >= 3;
       case 'NIGHT_MASK':
         return me.role === 'MASK' && me.alive && (!this.night.maskInspectActed || !this.night.maskActed);
+      case 'NIGHT_DREAMER':
+        return me.role === 'DREAMER' && me.alive && !this.night.dreamerActed;
+      case 'NIGHT_BEAUTY_CHARM':
+        return me.role === 'WOLF_BEAUTY' && me.alive && !this.night.beautyCharmActed;
+      case 'NIGHT_GRAVE_KEEPER':
+        return me.role === 'GRAVE_KEEPER' && me.alive && !this.night.graveKeeperActed;
       case 'NIGHT_WOLVES':
         return this.aliveKnifeWolves().some((wolf) => wolf.id === me.id) && !this.night.wolfPicks.has(me.seat);
       case 'NIGHT_GUARD':
@@ -2375,7 +3979,7 @@ export class Game {
         return this.sheriffTransferFrom === me.seat && this.sheriffTransferChoice === undefined;
       case 'HUNTER_SHOOT': {
         return (
-          this.canShootAsHunter(me) &&
+          this.hasDeathShotAbility(me) &&
           this.hunterPendingSeat === me.seat &&
           this.hunterChoice === undefined
         );
@@ -2407,12 +4011,22 @@ export class Game {
         if (this.night.maskActed) return { kind: 'mask', target: this.night.maskTarget ?? 0 };
         if (this.night.maskInspectActed) return { kind: 'maskInspect', target: this.night.maskInspectTarget ?? 0 };
         return undefined;
+      case 'NIGHT_DREAMER':
+        return me.role === 'DREAMER' && this.night.dreamerActed && this.night.dreamerTarget !== null
+          ? { kind: 'dreamer', target: this.night.dreamerTarget }
+          : undefined;
       case 'NIGHT_WOLVES': {
         if (!this.aliveKnifeWolves().some((wolf) => wolf.id === me.id) && !this.night.wolfPicks.has(me.seat)) return undefined;
         if (!this.night.wolfPicks.has(me.seat)) return undefined;
         const a: WolfAction = { kind: 'wolf', target: this.night.wolfPicks.get(me.seat)! };
         return a;
       }
+      case 'NIGHT_BEAUTY_CHARM':
+        return me.role === 'WOLF_BEAUTY' && this.night.beautyCharmActed && this.night.beautyCharmTarget !== null
+          ? { kind: 'beautyCharm', target: this.night.beautyCharmTarget }
+          : undefined;
+      case 'NIGHT_GRAVE_KEEPER':
+        return me.role === 'GRAVE_KEEPER' && this.night.graveKeeperActed ? true : undefined;
       case 'NIGHT_GUARD': {
         if (me.role === 'MECHANICAL_WOLF') {
           return this.night.mechanicalGuardActed
@@ -2484,11 +4098,15 @@ export class Game {
       case 'NIGHT_MECHANICAL': return me.role === 'MECHANICAL_WOLF';
       case 'NIGHT_DANCER': return me.role === 'DANCER';
       case 'NIGHT_MASK': return me.role === 'MASK';
+      case 'NIGHT_DREAMER': return me.role === 'DREAMER';
       case 'NIGHT_WOLVES': return this.aliveKnifeWolves().some((wolf) => wolf.id === me.id);
+      case 'NIGHT_BEAUTY_CHARM':
+        return me.role === 'WOLF_BEAUTY' && me.alive && !this.night.beautyCharmActed;
       case 'NIGHT_GUARD': return me.role === 'GUARD' || (me.role === 'MECHANICAL_WOLF' && this.mechanicalLearnedRole === 'GUARD');
       case 'NIGHT_WITCH': return me.role === 'WITCH' || (me.role === 'MECHANICAL_WOLF' && this.mechanicalLearnedRole === 'WITCH');
       case 'NIGHT_SEER': return me.role === 'SEER' || (me.role === 'MECHANICAL_WOLF' && this.mechanicalLearnedRole === 'SEER');
       case 'NIGHT_SPIRIT_SEER': return me.role === 'SPIRIT_SEER' || (me.role === 'MECHANICAL_WOLF' && this.mechanicalLearnedRole === 'SPIRIT_SEER');
+      case 'NIGHT_GRAVE_KEEPER': return me.role === 'GRAVE_KEEPER';
       default: return false;
     }
   }
@@ -2503,10 +4121,14 @@ export class Game {
         return { done: this.night.dancerActed ? 1 : 0, total: 1 };
       case 'NIGHT_MASK':
         return { done: Number(this.night.maskInspectActed) + Number(this.night.maskActed), total: 2 };
+      case 'NIGHT_DREAMER':
+        return { done: this.night.dreamerActed ? 1 : 0, total: 1 };
       case 'NIGHT_WOLVES': {
         const wolves = this.aliveKnifeWolves();
         return { done: this.night.wolfPicks.size, total: wolves.length };
       }
+      case 'NIGHT_BEAUTY_CHARM':
+        return { done: this.night.beautyCharmActed ? 1 : 0, total: 1 };
       case 'NIGHT_GUARD': {
         const done = me?.role === 'MECHANICAL_WOLF' ? this.night.mechanicalGuardActed : this.night.guardActed;
         return { done: done ? 1 : 0, total: 1 };
@@ -2523,6 +4145,8 @@ export class Game {
         const done = me?.role === 'MECHANICAL_WOLF' ? this.night.mechanicalSpiritActed : this.night.spiritActed;
         return { done: done ? 1 : 0, total: 1 };
       }
+      case 'NIGHT_GRAVE_KEEPER':
+        return { done: this.night.graveKeeperActed ? 1 : 0, total: 1 };
       case 'SHERIFF_SIGNUP':
         return { done: this.sheriffSignup.size, total: this.alivePlayers().length };
       case 'SHERIFF_VOTE':
@@ -2549,6 +4173,8 @@ export class Game {
     switch (this.phase) {
       case 'WAITING':
         return '等待房主开始游戏。';
+      case 'ROLE_REVEAL':
+        return '按住（或点开）下方身份牌看清你的角色和能力。看清后点「我已看清我的身份」。';
       case 'NIGHT_START':
         return '天黑请闭眼，所有人停止发言。';
       case 'NIGHT_HYBRID':
@@ -2570,6 +4196,20 @@ export class Game {
             : '先查验一名玩家是否在当夜舞池，再选择一名玩家戴面具；两次可以选择同一人或自己。';
         }
         return '假面正在行动，请闭眼等待。';
+      case 'NIGHT_DREAMER':
+        if (me?.role === 'DREAMER') {
+          return this.lastDreamedSeat === null
+            ? '请选择另一名存活玩家成为梦游者；本夜不能跳过。'
+            : `请选择另一名存活玩家成为梦游者；${this.lastDreamedSeat} 号是上一夜目标，再次选择会令其出局。`;
+        }
+        return '摄梦人正在选择梦游者，请闭眼等待。';
+      case 'NIGHT_BEAUTY_CHARM':
+        if (me?.role === 'WOLF_BEAUTY') {
+          return this.lastCharmedSeat === null
+            ? '请选择今晚要魅惑的玩家。你出局时，被魅惑的人会为你殉情（从下一夜起生效）。'
+            : `请选择今晚要魅惑的玩家。目前 ${this.lastCharmedSeat} 号是上一夜的目标 —— 你一出局他就会殉情。`;
+        }
+        return '狼美人正在选择要魅惑的人，请闭眼等待。';
       case 'NIGHT_WOLVES':
         if (me && this.aliveKnifeWolves().some((wolf) => wolf.id === me.id)) {
           return '请与狼队友协商后，选择今晚要击杀的玩家。多数票生效，平票则空刀。';
@@ -2590,6 +4230,14 @@ export class Game {
         if (me?.role === 'SPIRIT_SEER') return '请选择一名玩家，查验他的具体身份。';
         if (me?.role === 'MECHANICAL_WOLF' && this.mechanicalSkillActive() && this.mechanicalLearnedRole === 'SPIRIT_SEER') return '请选择一名玩家，使用复制的通灵查验。';
         return '通灵师正在查验，请闭眼等待。';
+      case 'NIGHT_GRAVE_KEEPER': {
+        if (me?.role !== 'GRAVE_KEEPER') return '守墓人正在查看昨天的放逐结果，请闭眼等待。';
+        const check = this.night.graveCheck;
+        if (!check) return '请确认今天的放逐结果。';
+        if (check.seat === null) return '昨天没有人被投票放逐，今晚没有新信息。';
+        const who = this.bySeat(check.seat);
+        return `昨天被放逐的 ${check.seat} 号（${who?.nickname ?? '?'}）是${check.isWolf ? '【狼人】' : '【好人】'}。`;
+      }
       case 'NIGHT_RESOLVE':
         return '天就快亮了……';
       case 'DAY_ANNOUNCE':
@@ -2606,18 +4254,22 @@ export class Game {
         return this.sheriffVoterSeats().includes(me?.seat ?? -1) ? '请在 PK 候选人中重新投票；再次平票则警徽流失。' : '请等待非候选人重新投票。';
       case 'DAY_SPEECH':
         if (me?.seat === this.sheriffSeat && this.speechDirection === null) return '请选择顺时针或逆时针发言；你最后发言并归票。';
+        if (me?.role === 'KNIGHT' && me.alive && !this.knightUsed) return '请按照页面显示的顺序依次发言；你还可以翻牌决斗一名玩家（整局一次）。';
         return '请按照页面显示的顺序依次发言。';
       case 'DAY_VOTE':
-        if (me?.role === 'WOLF_KING' && me.alive) {
-          return '依次发言后投票；你也可以自爆并带走一名玩家（自爆后直接进入黑夜）。';
-        }
+        // 注意：这里绝不能按角色给不同提示（曾经给狼人写过「你也可以自爆」——
+        // 同屏瞄一眼公开提示就知道谁是狼了）。自爆入口是隐藏手势，
+        // 说明只出现在按住身份牌时的私密区域。
         return '依次发言后投票，得票最多者被放逐；平票则无人出局。';
       case 'DAY_EXILE':
         return '正在统计放逐结果……';
       case 'SHERIFF_TRANSFER':
         return me?.seat === this.sheriffTransferFrom ? '请选择一名存活玩家移交警徽，或撕毁警徽。' : '警长正在处理警徽。';
       case 'HUNTER_SHOOT':
-        return '猎人出局，可以开枪带走一名玩家，也可以放弃。';
+        if (me?.seat === this.hunterPendingSeat) {
+          return `${this.deathShooterName(me)}出局，可以开枪带走一名玩家，也可以放弃。`;
+        }
+        return `${this.hunterPendingSeat === null ? '玩家' : this.deathShooterName(this.bySeat(this.hunterPendingSeat)!)}正在决定是否开枪。`;
       case 'WOLF_KING_BOOM':
         return '白狼王自爆，请选择要带走一名玩家。';
       case 'GAME_OVER':
@@ -2753,8 +4405,15 @@ function emptyNight(): NightState {
     maskInspectActed: false,
     maskTarget: null,
     maskActed: false,
+    dreamerTarget: null,
+    dreamerActed: false,
+    beautyCharmTarget: null,
+    beautyCharmActed: false,
+    darkLordReflectVictim: null,
     wolfPicks: new Map(),
     wolfTarget: null,
+    puppetPicks: new Map(),
+    puppetTarget: null,
     guardTarget: null,
     guardActed: false,
     mechanicalGuardTarget: null,
@@ -2776,6 +4435,8 @@ function emptyNight(): NightState {
     mechanicalSpiritTarget: null,
     mechanicalSpiritRole: null,
     mechanicalSpiritActed: false,
+    graveCheck: null,
+    graveKeeperActed: false,
   };
 }
 

@@ -115,6 +115,33 @@ try {
   assert.equal(me?.nickname, username, '房间昵称必须使用登录账号名，不能由客户端伪造');
   console.log('  ✔ 登录用户能加入公开房间，房间昵称以账号为准');
 
+  const ownCreated = nextMessage(player, (message) =>
+    message.t === 'room' && message.room !== null && message.room.roomId !== roomId,
+  );
+  player.send(JSON.stringify({ t: 'room.create', nickname: username }));
+  const ownRoomMessage = await ownCreated;
+  assert.equal(ownRoomMessage.t, 'room');
+  assert.ok(ownRoomMessage.room);
+  const ownRoomId = ownRoomMessage.room.roomId;
+
+  const hallRecords = await api<{
+    halls: Array<{ roomId: string; relation: string; active: boolean }>;
+  }>('/api/hall-records', {}, registered.token);
+  const ownRecord = hallRecords.halls.find((hall) => hall.roomId === ownRoomId);
+  assert.deepEqual(
+    { relation: ownRecord?.relation, active: ownRecord?.active },
+    { relation: 'OWNER', active: true },
+  );
+  console.log('  ✔ 首页大厅记录能区分自己创建的大厅与当前开启状态');
+
+  player.send(JSON.stringify({ t: 'room.leave' }));
+  const reopened = nextMessage(player, (message) => message.t === 'room' && message.room?.roomId === ownRoomId);
+  player.send(JSON.stringify({ t: 'hall.open', roomId: ownRoomId }));
+  const reopenedMessage = await reopened;
+  assert.equal(reopenedMessage.t, 'room');
+  assert.equal(reopenedMessage.room?.roomId, ownRoomId);
+  console.log('  ✔ 厅主离开后可以用原大厅号重新开启历史大厅');
+
   console.log('\n✨ 账号与大厅集成测试通过\n');
 } finally {
   for (const socket of sockets) socket.close();

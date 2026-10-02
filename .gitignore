@@ -8,3 +8,4 @@ dist/
 data/*.db
 data/*.db-shm
 data/*.db-wal
+.werewolf-server-*.pid

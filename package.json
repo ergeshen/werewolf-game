@@ -6,15 +6,23 @@
   "description": "H5 在线狼人杀——账号、公开大厅、服务端权威规则与 WebSocket 实时对局",
   "scripts": {
     "start": "node scripts/run.mjs src/server/index.ts",
+    "restart": "node scripts/restart.mjs",
     "dev": "node scripts/run.mjs src/server/index.ts",
-    "test": "node scripts/run.mjs src/shared/engine.test.ts && node scripts/run.mjs src/server/database.test.ts && node scripts/run.mjs scripts/lib/firewall.test.ts && node scripts/run.mjs web/app/net.test.ts",
+    "test": "node scripts/run.mjs src/shared/engine.test.ts && node scripts/run.mjs src/server/database.test.ts && node scripts/run.mjs src/server/persistence.test.ts && node scripts/run.mjs scripts/lib/firewall.test.ts && node scripts/run.mjs web/app/net.test.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.client.json",
+    "check:templates": "node scripts/check-templates.mjs",
     "smoke": "node scripts/run.mjs scripts/smoke.ts",
     "smoke:auth": "node scripts/run.mjs scripts/auth-lobby-smoke.ts",
+    "smoke:hex": "node scripts/run.mjs scripts/hex-smoke.ts",
     "bots": "node scripts/run.mjs scripts/bots.ts",
     "pace": "node scripts/run.mjs scripts/pace.ts",
+    "timing": "node scripts/run.mjs scripts/board-timing.ts",
     "doctor": "node scripts/run.mjs scripts/doctor.ts",
-    "icons": "node scripts/make-icons.mjs"
+    "icons": "node scripts/make-icons.mjs",
+    "voice": "node scripts/make-voice-pack.mjs",
+    "voice:sample": "node scripts/make-voice-pack.mjs --sample",
+    "voice:audition": "node scripts/make-voice-audition.mjs",
+    "voice:packs": "node scripts/set-voice-packs.mjs"
   },
   "dependencies": {
     "libsql": "^0.5.29",

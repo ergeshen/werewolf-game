@@ -62,7 +62,15 @@ async function main(): Promise<void> {
   for (let i = 1; i <= PLAYER_COUNT; i++) {
     // wolfKingSelfDestruct 对普通狼人无效；只有真的拿到白狼王那张牌的机器人会自爆。
     // 这样第二个场景不用去猜谁是白狼王。
-    bots.push(new BotClient(`玩家${i}`, { wolfKingSelfDestruct: true }));
+    bots.push(
+      new BotClient(`玩家${i}`, {
+        wolfKingSelfDestruct: true,
+        // 玩家1 是房主：端到端测试里没人替他按按钮，得让机器人自己按，
+        // 白天没有计时器的过场阶段也得由他推 —— 否则整局停在天亮。
+        autoBeginNight: i === 1,
+        autoAdvanceDay: i === 1,
+      }),
+    );
   }
   await Promise.all(bots.map((b) => b.connect(WS_URL)));
   pass(`${PLAYER_COUNT} 个客户端已连接`);

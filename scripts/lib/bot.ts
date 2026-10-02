@@ -50,6 +50,21 @@ export interface BotOptions {
    * 白狼王可能永远不自爆，那条路径就永远没被测到。
    */
   wolfKingSelfDestruct?: boolean;
+  /**
+   * 如果这个机器人是房主，是否自动按下「天黑请闭眼」（默认 false）。
+   *
+   * 端到端测试里房主就是机器人，不自动按就会永远卡在身份确认阶段；
+   * 而 `npm run bots` 里房主是真人，必须留给他自己按 —— 那正是这个功能的意义。
+   */
+  autoBeginNight?: boolean;
+  /**
+   * 如果这个机器人是房主，是否自动推进白天的「无行动过场阶段」（默认 false）。
+   *
+   * 白天阶段故意没有计时器（面杀节奏由真人控制），只能靠房主点「跳过阶段」。
+   * 端到端测试里房主是机器人，不推就永远停在 DAY_ANNOUNCE；
+   * `npm run bots` 里房主是真人，这个按钮必须留给他 —— 和 autoBeginNight 同一个道理。
+   */
+  autoAdvanceDay?: boolean;
 }
 
 export class BotClient {
@@ -57,6 +72,8 @@ export class BotClient {
   readonly obs: BotObservation = newObservation();
   readonly errors: string[] = [];
   readonly wolfKingSelfDestruct: boolean;
+  readonly autoBeginNight: boolean;
+  readonly autoAdvanceDay: boolean;
 
   room: RoomView | null = null;
   game: GameView | null = null;
@@ -76,6 +93,8 @@ export class BotClient {
     this.recordErrors = options.recordErrors ?? true;
     this.onUpdate = options.onUpdate;
     this.wolfKingSelfDestruct = options.wolfKingSelfDestruct ?? false;
+    this.autoBeginNight = options.autoBeginNight ?? false;
+    this.autoAdvanceDay = options.autoAdvanceDay ?? false;
   }
 
   get connected(): boolean {
@@ -125,7 +144,8 @@ export class BotClient {
         this.room = msg.room;
         if (msg.room) this.auditRoomView(msg.room);
         break;
-      case 'game':
+      case 'game': {
+        const prevPhase = this.game?.phase ?? null;
         this.game = msg.game;
         if (msg.game) {
           /**
@@ -136,9 +156,17 @@ export class BotClient {
            * 机器人整局都不出牌 —— 表现就是「第二局莫名其妙 20 天流局」或者
            * 「白狼王一直不自爆，直到第 5 天才炸」这种看天吃饭的偶发失败。
            *
-           * 一局永远从「第 1 天 NIGHT_START」开始，用它当新局信号最可靠。
+           * ⚠️ 只认「真正进入新局」的边沿：上一帧不是 ROLE_REVEAL、这一帧才是。
+           * 身份确认阶段每来一个人确认，服务端就全场广播一次 —— 如果每次收到
+           * 都清空，别人确认的广播会把自己的去重键洗掉，机器人就会重复发
+           * confirmRole，全场收到一串 ALREADY_DONE 噪音错误。
+           * NIGHT_START 那一支同理只在边沿触发（上一帧不是它）。
            */
-          if (msg.game.day === 1 && msg.game.phase === 'NIGHT_START') {
+          const isNewGameStart =
+            msg.game.day === 1 &&
+            ((msg.game.phase === 'ROLE_REVEAL' && prevPhase !== 'ROLE_REVEAL') ||
+              (msg.game.phase === 'NIGHT_START' && prevPhase !== 'NIGHT_START'));
+          if (isNewGameStart) {
             this.actedKeys.clear();
           }
           this.auditGameView(msg.game);
@@ -147,6 +175,7 @@ export class BotClient {
           this.actedKeys.clear();
         }
         break;
+      }
       case 'error':
         if (this.recordErrors) this.errors.push(`${msg.code}: ${msg.message}`);
         break;
@@ -214,10 +243,67 @@ export class BotClient {
     }
   }
 
+  /**
+   * 身份确认阶段：机器人自动确认看牌，必要时代替房主按下「天黑请闭眼」。
+   *
+   * 这一阶段 `myTurn` 是 false（没有行动可以提交），所以必须放在
+   * `playIfMyTurn` 的 myTurn 判断**之前**调用，否则机器人会一直干等。
+   */
+  private handleRoleReveal(): void {
+    const game = this.game;
+    if (!game || game.phase !== 'ROLE_REVEAL') return;
+    const view = game.roleReveal;
+    if (!view) return;
+
+    // 去重键必须「按局」隔离：重新发牌是原地 ROLE_REVEAL → ROLE_REVEAL，
+    // 边沿检测认不出新一局。每局开局日志都有一条「本局共 N 人」，
+    // 用它的出现次数当局号 —— 重发牌后次数 +1，机器人就会重新确认。
+    const epoch = game.log.filter((line) => line.includes('本局共')).length;
+    const confirmKey = `reveal:confirm:${epoch}`;
+    const beginKey = `reveal:begin:${epoch}`;
+
+    if (!view.iConfirmed) {
+      if (this.actedKeys.has(confirmKey)) return;
+      this.actedKeys.add(confirmKey);
+      this.send({ t: 'game.confirmRole' });
+      return;
+    }
+
+    // 只有被明确授权的机器人（也就是端到端测试里那个当房主的）才按按钮；
+    // `npm run bots` 里房主是真人，必须留给他自己按。
+    if (!this.autoBeginNight || !view.iAmHost || !view.canBeginNight) return;
+    if (this.actedKeys.has(beginKey)) return;
+    this.actedKeys.add(beginKey);
+    this.send({ t: 'game.beginNight' });
+  }
+
+  /**
+   * 房主机器人替真人按「跳过阶段」：只推进白天的无行动过场阶段。
+   *
+   * 这些阶段（天亮公示 / 竞选发言 / 白天发言 / 放逐结算）没有计时器也没有
+   * 可提交的行动，工程上只能由房主推进 —— 端到端测试里房主是机器人，
+   * 不推整局就停在天亮。有行动的阶段（投票等）不推，等机器人自己提交。
+   */
+  private handleHostAdvance(): void {
+    if (!this.autoAdvanceDay) return;
+    const game = this.game;
+    if (!game || game.phase === 'GAME_OVER') return;
+    if (!['DAY_ANNOUNCE', 'SHERIFF_CAMPAIGN', 'SHERIFF_PK', 'DAY_SPEECH', 'DAY_EXILE'].includes(game.phase)) return;
+    const room = this.room;
+    if (!room || room.hostId !== this.token) return;
+    const key = `advance:${game.day}:${game.phase}`;
+    if (this.actedKeys.has(key)) return;
+    this.actedKeys.add(key);
+    this.send({ t: 'game.advance' });
+  }
+
   /** 轮到我出牌就立刻出，让对局能自动跑下去 */
   playIfMyTurn(): void {
     const game = this.game;
-    if (!game || !game.myTurn) return;
+    if (!game) return;
+    this.handleRoleReveal();
+    this.handleHostAdvance();
+    if (!game.myTurn) return;
     const me = game.me;
     if (!me) return;
 
@@ -268,7 +354,17 @@ export class BotClient {
         const mates = new Set(me.teammates ?? []);
         const targets = game.myOptions.filter((s) => !mates.has(s) && s !== me.seat);
         const target = pick(targets.length > 0 ? targets : game.myOptions.filter((s) => s !== me.seat));
-        this.send({ t: 'game.action', action: { kind: 'wolf', target } });
+        /**
+         * 「唯邻是从」：首夜还要选一名傀儡，否则服务端会拒绝整个提交
+         * （首夜必须选）。机器人从候选人里挑一个 —— 取最小的座位号，
+         * 这样多个机器人容易投到同一个人，不必依赖平票逻辑。
+         */
+        const candidates = game.puppetInfo?.candidates ?? [];
+        if (candidates.length > 0) {
+          this.send({ t: 'game.action', action: { kind: 'wolf', target, puppet: candidates[0]! } });
+        } else {
+          this.send({ t: 'game.action', action: { kind: 'wolf', target } });
+        }
         break;
       }
       case 'NIGHT_GUARD': {
