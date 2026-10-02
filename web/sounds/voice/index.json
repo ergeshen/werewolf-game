@@ -1,0 +1,52 @@
+{
+ "packs": [
+  {
+   "id": "tw-hsiaochen-yujie",
+   "label": "台灣御姐·曉臻",
+   "voice": "zh-TW-HsiaoChenNeural",
+   "rate": "-6%",
+   "pitch": "-12Hz",
+   "count": 75
+  },
+  {
+   "id": "xiaoxiao",
+   "label": "曉曉·溫暖",
+   "voice": "zh-CN-XiaoxiaoNeural",
+   "rate": "+0%",
+   "pitch": "+0Hz",
+   "count": 75
+  },
+  {
+   "id": "xiaobei",
+   "label": "東北話·曉北",
+   "voice": "zh-CN-liaoning-XiaobeiNeural",
+   "rate": "+0%",
+   "pitch": "+0Hz",
+   "count": 75
+  },
+  {
+   "id": "tw-yunjhe",
+   "label": "台灣男聲·雲哲",
+   "voice": "zh-TW-YunJheNeural",
+   "rate": "+0%",
+   "pitch": "+0Hz",
+   "count": 75
+  },
+  {
+   "id": "yunjian",
+   "label": "云健·沉穩",
+   "voice": "zh-CN-YunjianNeural",
+   "rate": "+0%",
+   "pitch": "+0Hz",
+   "count": 75
+  },
+  {
+   "id": "yunxi",
+   "label": "云希·年輕",
+   "voice": "zh-CN-YunxiNeural",
+   "rate": "+0%",
+   "pitch": "+0Hz",
+   "count": 75
+  }
+ ]
+}
